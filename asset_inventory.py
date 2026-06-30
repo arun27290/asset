@@ -46,6 +46,7 @@ _FLAGS_FILE  = Path("flags.json")
 _CORR_FILE   = Path("corrections.json")
 _DECOM_FILE  = Path("decommissions.json")
 _NEWSRV_FILE = Path("new_servers.json")
+_TSHIRT_FILE = Path("tshirt_changes.json")
 _INVENTORY_FILE      = Path("current_inventory.xlsx")
 _INVENTORY_META_FILE = Path("current_inventory_meta.json")
 _INVENTORY_PREV_FILE = Path("prev_inventory.xlsx")
@@ -646,24 +647,97 @@ def delete_new_server(ns_id, username):
         _save_json(_NEWSRV_FILE, news)
         _audit("NEWSRV_DELETE", f"admin={username} id={ns_id}")
 
-def add_tag(hostname, tag, username):
+# ── T-shirt size (CPU/RAM) change helpers ─────────────────────────────────────
+# Platforms where CPU/RAM directly affects contract pricing —
+# only these accept T-shirt size change submissions.
+TSHIRT_PLATFORMS = ["EMA", "EPMC", "JEA"]
+
+def get_tshirt_changes(): return _load_json(_TSHIRT_FILE)
+
+def add_tshirt_change(hostname, platform, current_cpu, current_ram,
+                      new_cpu, new_ram, reason, username, full_name):
+    changes = get_tshirt_changes()
+    entry = {
+        "id":          secrets.token_hex(8),
+        "hostname":    hostname.strip(),
+        "platform":    platform.strip(),
+        "current_cpu": current_cpu.strip(),
+        "current_ram": current_ram.strip(),
+        "new_cpu":     new_cpu.strip(),
+        "new_ram":     new_ram.strip(),
+        "reason":      reason.strip(),
+        "user":        username,
+        "name":        full_name,
+        "ts":          datetime.now().strftime("%d %b %Y %H:%M"),
+        "status":      "Pending",   # Pending | Approved | Rejected
+    }
+    changes[entry["id"]] = entry
+    _save_json(_TSHIRT_FILE, changes)
+    _audit("TSHIRT_ADD",
+           f"user={username} host={hostname} cpu={current_cpu}->{new_cpu} ram={current_ram}->{new_ram}")
+    return entry
+
+def mark_tshirt_decision(t_id, decision, reason, username):
+    changes = get_tshirt_changes()
+    if t_id in changes:
+        changes[t_id]["status"]          = decision
+        changes[t_id]["decision_reason"] = (reason or "").strip()
+        changes[t_id]["reviewed_by"]     = username
+        changes[t_id]["reviewed_ts"]     = datetime.now().strftime("%d %b %Y %H:%M")
+        _save_json(_TSHIRT_FILE, changes)
+        _audit(f"TSHIRT_{decision.upper()}", f"admin={username} id={t_id} reason={reason}")
+
+def delete_tshirt_change(t_id, username):
+    changes = get_tshirt_changes()
+    if t_id in changes:
+        del changes[t_id]
+        _save_json(_TSHIRT_FILE, changes)
+        _audit("TSHIRT_DELETE", f"admin={username} id={t_id}")
+
+def add_tag(hostname, tag, username, full_name):
+    """Tags are stored as rich objects so we know who added them and
+    whether Admin has accepted them as official."""
     tags = get_tags()
     hn = hostname.strip().lower()
     if hn not in tags: tags[hn] = []
-    if tag not in tags[hn]:
-        tags[hn].append(tag)
+    if not any(t["tag"] == tag for t in tags[hn]):
+        entry = {
+            "id":     secrets.token_hex(6),
+            "tag":    tag,
+            "user":   username,
+            "name":   full_name,
+            "ts":     datetime.now().strftime("%d %b %Y %H:%M"),
+            "status": "Unverified",   # Unverified | Accepted
+        }
+        tags[hn].append(entry)
         _save_json(_TAGS_FILE, tags)
         _audit("TAG_ADD", f"user={username} host={hostname} tag={tag}")
     return tags[hn]
 
-def remove_tag(hostname, tag, username):
+def remove_tag_by_id(hostname, tag_id, username):
     tags = get_tags()
     hn = hostname.strip().lower()
-    if hn in tags and tag in tags[hn]:
-        tags[hn].remove(tag)
+    if hn in tags:
+        removed = next((t for t in tags[hn] if t["id"] == tag_id), None)
+        tags[hn] = [t for t in tags[hn] if t["id"] != tag_id]
         if not tags[hn]: del tags[hn]
         _save_json(_TAGS_FILE, tags)
-        _audit("TAG_REMOVE", f"user={username} host={hostname} tag={tag}")
+        _audit("TAG_REMOVE", f"user={username} host={hostname} "
+               f"tag={removed['tag'] if removed else tag_id}")
+    return tags.get(hn, [])
+
+def accept_tag(hostname, tag_id, username):
+    """Admin marks a tag as Accepted / official."""
+    tags = get_tags()
+    hn = hostname.strip().lower()
+    if hn in tags:
+        for t in tags[hn]:
+            if t["id"] == tag_id:
+                t["status"]      = "Accepted"
+                t["accepted_by"] = username
+                t["accepted_ts"] = datetime.now().strftime("%d %b %Y %H:%M")
+        _save_json(_TAGS_FILE, tags)
+        _audit("TAG_ACCEPT", f"admin={username} host={hostname} id={tag_id}")
     return tags.get(hn, [])
 
 def add_note(hostname, note_text, username, full_name):
@@ -1107,7 +1181,7 @@ def tag_add():
     hn   = data.get("hostname", "").strip()
     tag  = data.get("tag", "").strip()
     if not hn or not tag: return jsonify({"error": "Missing fields"}), 400
-    tags = add_tag(hn, tag, u["username"])
+    tags = add_tag(hn, tag, u["username"], u.get("full_name", u["username"]))
     return jsonify({"ok": True, "tags": tags})
 
 @app.route("/tag/remove", methods=["POST"])
@@ -1115,9 +1189,19 @@ def tag_add():
 def tag_remove():
     u    = _current_user()
     data = request.get_json(force=True)
-    hn   = data.get("hostname", "").strip()
-    tag  = data.get("tag", "").strip()
-    tags = remove_tag(hn, tag, u["username"])
+    hn      = data.get("hostname", "").strip()
+    tag_id  = data.get("id", "").strip()
+    tags = remove_tag_by_id(hn, tag_id, u["username"])
+    return jsonify({"ok": True, "tags": tags})
+
+@app.route("/admin/tag/accept", methods=["POST"])
+@_login_required
+@_admin_required
+def admin_tag_accept():
+    data   = request.get_json(force=True)
+    hn     = data.get("hostname", "").strip()
+    tag_id = data.get("id", "").strip()
+    tags = accept_tag(hn, tag_id, session.get("username", ""))
     return jsonify({"ok": True, "tags": tags})
 
 # ── User: note routes ─────────────────────────────────────────────────────────
@@ -1317,17 +1401,85 @@ def admin_newsrv_report():
                      download_name=f"new_servers_report_{datetime.now().strftime('%Y%m%d')}.xlsx",
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
+# ── User: T-shirt size (CPU/RAM) change routes ────────────────────────────────
+@app.route("/tshirt/add", methods=["POST"])
+@_login_required
+def tshirt_add():
+    u    = _current_user()
+    data = request.get_json(force=True)
+    hn   = data.get("hostname","").strip()
+    pl   = data.get("platform","").strip()
+    cc   = data.get("current_cpu","").strip()
+    cr   = data.get("current_ram","").strip()
+    nc   = data.get("new_cpu","").strip()
+    nr   = data.get("new_ram","").strip()
+    rsn  = data.get("reason","").strip()
+    if not hn:
+        return jsonify({"error": "Hostname is required"}), 400
+    if pl not in TSHIRT_PLATFORMS:
+        return jsonify({"error": f"T-shirt size changes only apply to {', '.join(TSHIRT_PLATFORMS)} servers"}), 400
+    if not nc and not nr:
+        return jsonify({"error": "Provide a new CPU or new RAM value"}), 400
+    entry = add_tshirt_change(hn, pl, cc, cr, nc, nr, rsn,
+                              u["username"], u.get("full_name", u["username"]))
+    return jsonify({"ok": True, "id": entry["id"]})
+
+@app.route("/admin/tshirt/review", methods=["POST"])
+@_login_required
+@_admin_required
+def admin_tshirt_review():
+    data     = request.get_json(force=True)
+    decision = data.get("decision","Approved").strip()
+    reason   = data.get("reason","")
+    if decision not in ("Approved","Rejected"):
+        return jsonify({"error":"Invalid decision"}), 400
+    mark_tshirt_decision(data.get("id","").strip(), decision, reason, session.get("username",""))
+    return jsonify({"ok": True})
+
+@app.route("/admin/tshirt/delete", methods=["POST"])
+@_login_required
+@_admin_required
+def admin_tshirt_delete():
+    data = request.get_json(force=True)
+    delete_tshirt_change(data.get("id","").strip(), session.get("username",""))
+    return jsonify({"ok": True})
+
+@app.route("/admin/tshirt_report")
+@_login_required
+@_admin_required
+def admin_tshirt_report():
+    changes = get_tshirt_changes()
+    if not changes: return "No T-shirt size changes yet", 200
+    rows = [{
+        "ID": v["id"], "Hostname": v["hostname"], "Platform": v["platform"],
+        "Current CPU": v["current_cpu"], "Current RAM": v["current_ram"],
+        "New CPU": v["new_cpu"], "New RAM": v["new_ram"],
+        "Reason": v["reason"], "Submitted By": v["name"], "Username": v["user"],
+        "Submitted At": v["ts"], "Status": v["status"],
+        "Decision Reason": v.get("decision_reason",""),
+        "Reviewed By": v.get("reviewed_by",""),
+        "Reviewed At": v.get("reviewed_ts",""),
+    } for v in changes.values()]
+    buf = io.BytesIO()
+    pd.DataFrame(rows).to_excel(buf, index=False)
+    buf.seek(0)
+    return send_file(buf, as_attachment=True,
+                     download_name=f"tshirt_size_changes_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
 @app.route("/admin/monthly_changes_report")
 @_login_required
 @_admin_required
 def admin_monthly_changes_report():
     """Consolidated, ready-to-apply record of every APPROVED change this
-    month — corrections, decommissions, and new servers — across three
-    sheets in one Excel file. This is what admin works from when updating
-    next month's master inventory."""
-    corrs = get_corrections()
-    decs  = get_decommissions()
-    news  = get_new_servers()
+    month — corrections, decommissions, new servers, and T-shirt size
+    (CPU/RAM) changes — across four sheets in one Excel file. This is what
+    admin works from when updating next month's master inventory and
+    when reconciling EMA/EPMC/JEA contract billing."""
+    corrs   = get_corrections()
+    decs    = get_decommissions()
+    news    = get_new_servers()
+    tshirts = get_tshirt_changes()
 
     corr_rows = [{
         "Hostname": v["hostname"], "Column": v["column"],
@@ -1353,7 +1505,17 @@ def admin_monthly_changes_report():
         "Admin Note": v.get("decision_reason",""),
     } for v in news.values() if v.get("status") == "Approved"]
 
-    if not corr_rows and not decom_rows and not newsrv_rows:
+    tshirt_rows = [{
+        "Hostname": v["hostname"], "Platform": v["platform"],
+        "Current CPU": v["current_cpu"], "Current RAM": v["current_ram"],
+        "New CPU": v["new_cpu"], "New RAM": v["new_ram"],
+        "Reason Given": v["reason"], "Submitted By": v["name"],
+        "Submitted At": v["ts"], "Approved By": v.get("reviewed_by",""),
+        "Approved At": v.get("reviewed_ts",""),
+        "Admin Note": v.get("decision_reason",""),
+    } for v in tshirts.values() if v.get("status") == "Approved"]
+
+    if not corr_rows and not decom_rows and not newsrv_rows and not tshirt_rows:
         return "No approved changes to report yet", 200
 
     buf = io.BytesIO()
@@ -1364,6 +1526,8 @@ def admin_monthly_changes_report():
             .to_excel(writer, sheet_name="Decommissions", index=False)
         (pd.DataFrame(newsrv_rows) if newsrv_rows else pd.DataFrame(columns=["Server HostName"])) \
             .to_excel(writer, sheet_name="New Servers", index=False)
+        (pd.DataFrame(tshirt_rows) if tshirt_rows else pd.DataFrame(columns=["Hostname"])) \
+            .to_excel(writer, sheet_name="T-Shirt Size Changes", index=False)
     buf.seek(0)
     fname = f"monthly_changes_to_apply_{datetime.now().strftime('%Y%m%d')}.xlsx"
     return send_file(buf, as_attachment=True, download_name=fname,
@@ -1470,10 +1634,15 @@ def admin_tags_report():
             match = df[df["Server HostName"].str.strip().str.lower() == hn_low]
             if not match.empty:
                 srv_row = match.iloc[0].to_dict()
-        for tag in tag_list:
+        for t in tag_list:
+            is_dict = isinstance(t, dict)
             rows.append({
                 "Hostname":    srv_row.get("Server HostName", hn_low),
-                "Tag":         tag,
+                "Tag":         t.get("tag", t) if is_dict else t,
+                "Status":      t.get("status","Unverified") if is_dict else "Unverified",
+                "Submitted By": t.get("name","") if is_dict else "",
+                "Submitted At": t.get("ts","") if is_dict else "",
+                "Accepted By": t.get("accepted_by","") if is_dict else "",
                 "Platform":    srv_row.get("Platform",""),
                 "Server Role": srv_row.get("Server Role",""),
                 "Final OS":    srv_row.get("Final OS",""),
@@ -1486,6 +1655,7 @@ def admin_tags_report():
     return send_file(buf, as_attachment=True,
                      download_name=f"tags_report_{datetime.now().strftime('%Y%m%d')}.xlsx",
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
 
 @app.route("/admin/notes_report")
 @_login_required
@@ -1584,14 +1754,21 @@ def admin_data():
         if df is not None and "Server HostName" in df.columns:
             m = df[df["Server HostName"].str.strip().str.lower() == hn_low]
             if not m.empty: srv = m.iloc[0].to_dict()
-        for tag in tag_list:
+        for t in tag_list:
             tag_rows.append({
-                "hostname":  srv.get("Server HostName", hn_low),
-                "tag":       tag,
-                "platform":  srv.get("Platform","—"),
-                "role":      srv.get("Server Role","—"),
-                "os":        srv.get("Final OS","—"),
-                "dc":        srv.get("Server DC Location","—"),
+                "id":          t.get("id",""),
+                "hn_key":      hn_low,
+                "hostname":    srv.get("Server HostName", hn_low),
+                "tag":         t.get("tag", t) if isinstance(t, dict) else t,
+                "user":        t.get("user","") if isinstance(t, dict) else "",
+                "name":        t.get("name","") if isinstance(t, dict) else "",
+                "ts":          t.get("ts","") if isinstance(t, dict) else "",
+                "status":      t.get("status","Unverified") if isinstance(t, dict) else "Unverified",
+                "accepted_by": t.get("accepted_by","") if isinstance(t, dict) else "",
+                "platform":    srv.get("Platform","—"),
+                "role":        srv.get("Server Role","—"),
+                "os":          srv.get("Final OS","—"),
+                "dc":          srv.get("Server DC Location","—"),
             })
 
     # ── Build inline notes table ─────────────────────────────────────────────
@@ -1651,8 +1828,15 @@ def admin_data():
     approved_news = [v for v in news.values() if v.get("status") == "Approved"]
     rejected_news = [v for v in news.values() if v.get("status") == "Rejected"]
 
+    tshirts = get_tshirt_changes()
+    pending_tshirts  = [v for v in tshirts.values() if v.get("status") == "Pending"]
+    approved_tshirts = [v for v in tshirts.values() if v.get("status") == "Approved"]
+    rejected_tshirts = [v for v in tshirts.values() if v.get("status") == "Rejected"]
+
     return jsonify({
         "tag_count":        sum(len(v) for v in tags.values()),
+        "tag_unverified":   len([t for r in tag_rows for t in [r] if t["status"]=="Unverified"]),
+        "tag_accepted":     len([t for r in tag_rows for t in [r] if t["status"]=="Accepted"]),
         "note_count":       sum(len(v) for v in notes.values()),
         "flag_count":       len(flags),
         "corr_pending":     len(pending_corrs),
@@ -1664,6 +1848,9 @@ def admin_data():
         "newsrv_pending":   len(pending_news),
         "newsrv_approved":  len(approved_news),
         "newsrv_rejected":  len(rejected_news),
+        "tshirt_pending":   len(pending_tshirts),
+        "tshirt_approved":  len(approved_tshirts),
+        "tshirt_rejected":  len(rejected_tshirts),
         "server_count":     STORE["total_rows"],
         "filename":         STORE["filename"] or "None",
         "uploaded_at":      STORE["uploaded_at"] or "—",
@@ -1674,10 +1861,12 @@ def admin_data():
         "corrections":      list(corrs.values()),
         "decommissions":    list(decs.values()),
         "new_servers":      list(news.values()),
+        "tshirt_changes":   list(tshirts.values()),
         "preset_tags":      PRESET_TAGS,
         "correctable_cols": CORRECTABLE_COLS,
         "decom_reasons":    DECOM_REASONS,
         "newsrv_fields":    NEW_SERVER_FIELDS,
+        "tshirt_platforms": TSHIRT_PLATFORMS,
     })
 
 # ── Export ────────────────────────────────────────────────────────────────────
@@ -1762,17 +1951,73 @@ def view_audit():
 def me():
     u = _current_user()
     if not u: return jsonify({"logged_in": False})
-    corrs = get_corrections()
-    decs  = get_decommissions()
-    news  = get_new_servers()
+    corrs   = get_corrections()
+    decs    = get_decommissions()
+    news    = get_new_servers()
+    tshirts = get_tshirt_changes()
     return jsonify({"logged_in": True, "username": u["username"],
                     "full_name": u.get("full_name", u["username"]),
                     "role": u.get("role","user"),
                     "pending_corrections": sum(1 for v in corrs.values() if v.get("status")=="Pending"),
                     "pending_decommissions": sum(1 for v in decs.values() if v.get("status")=="Pending"),
                     "pending_newservers": sum(1 for v in news.values() if v.get("status")=="Pending"),
+                    "pending_tshirts": sum(1 for v in tshirts.values() if v.get("status")=="Pending"),
                     "decom_reasons": DECOM_REASONS,
-                    "newsrv_fields": NEW_SERVER_FIELDS})
+                    "newsrv_fields": NEW_SERVER_FIELDS,
+                    "tshirt_platforms": TSHIRT_PLATFORMS,
+                    "preset_tags": PRESET_TAGS})
+
+@app.route("/my_activity")
+@_login_required
+def my_activity():
+    """Activity summary for the logged-in user — accessible to any user,
+    not just admin (unlike /admin/data)."""
+    u = _current_user()
+    uname = u["username"]
+    df = STORE["df"]
+
+    tags  = get_tags()
+    notes = get_notes()
+    corrs = get_corrections()
+
+    my_tag_rows = []
+    for hn_low, tag_list in tags.items():
+        srv = {}
+        if df is not None and "Server HostName" in df.columns:
+            m = df[df["Server HostName"].str.strip().str.lower() == hn_low]
+            if not m.empty: srv = m.iloc[0].to_dict()
+        for t in tag_list:
+            if isinstance(t, dict) and t.get("user") == uname:
+                my_tag_rows.append({
+                    "hostname": srv.get("Server HostName", hn_low),
+                    "tag": t.get("tag",""), "status": t.get("status","Unverified"),
+                    "ts": t.get("ts",""),
+                })
+
+    my_note_rows = []
+    for hn_low, note_list in notes.items():
+        srv = {}
+        if df is not None and "Server HostName" in df.columns:
+            m = df[df["Server HostName"].str.strip().str.lower() == hn_low]
+            if not m.empty: srv = m.iloc[0].to_dict()
+        for n in note_list:
+            if n.get("user") == uname:
+                my_note_rows.append({
+                    "hostname": srv.get("Server HostName", hn_low),
+                    "note": n.get("note",""), "ts": n.get("ts",""),
+                    "platform": srv.get("Platform",""),
+                })
+
+    my_corr_rows = [c for c in corrs.values() if c.get("user") == uname]
+
+    return jsonify({
+        "my_tag_count":   len(my_tag_rows),
+        "my_note_count":  len(my_note_rows),
+        "my_corr_count":  len(my_corr_rows),
+        "my_tags":        my_tag_rows,
+        "my_notes":       my_note_rows,
+        "my_corrections": my_corr_rows,
+    })
 
 @app.route("/")
 def index():
@@ -2129,6 +2374,9 @@ tr:hover td{background:var(--surf2)}
   <div class="nav-item" id="nav-newsrv" style="display:none"
        onclick="showPage('newsrv',this)">
     <span class="nav-icon">➕</span> Suggest New Server</div>
+  <div class="nav-item" id="nav-tshirt" style="display:none"
+       onclick="showPage('tshirt',this)">
+    <span class="nav-icon">👕</span> Update CPU / RAM</div>
 
   <div class="nav-section" id="nav-admin-section" style="display:none">Admin</div>
   <div class="nav-item" id="nav-upload" style="display:none"
@@ -2363,6 +2611,65 @@ tr:hover td{background:var(--surf2)}
   </div>
 </div>
 
+<!-- UPDATE CPU / RAM (T-SHIRT SIZE) -->
+<div class="page" id="page-tshirt">
+  <div class="shdr">👕 Update CPU / RAM (T-Shirt Size)</div>
+  <div style="max-width:660px">
+    <p style="color:var(--muted);font-size:.84rem;margin-bottom:14px">
+      Report a CPU or RAM change for an <b>EMA</b>, <b>EPMC</b>, or <b>JEA</b> server —
+      these platforms' contract pricing depends on server T-shirt size.
+      Admin will review and reconcile this with billing.
+    </p>
+
+    <div style="font-size:.74rem;color:var(--muted);margin-bottom:4px">Server Hostname</div>
+    <input type="text" id="tshirt-hostname" placeholder="Start typing hostname…"
+      style="width:100%;background:var(--surf2);border:1px solid var(--border);color:var(--text);
+      padding:9px 12px;border-radius:8px;font-size:.86rem;margin-bottom:4px"
+      oninput="tshirtHostSearch()" autocomplete="off">
+    <div id="tshirt-host-suggest" style="margin-bottom:4px"></div>
+    <div id="tshirt-host-selected" style="margin-bottom:10px"></div>
+
+    <div style="display:flex;gap:10px;margin-bottom:10px">
+      <div style="flex:1">
+        <div style="font-size:.74rem;color:var(--muted);margin-bottom:4px">Current CPU (optional)</div>
+        <input type="text" id="tshirt-current-cpu" placeholder="e.g. 4 vCPU"
+          style="width:100%;background:var(--surf2);border:1px solid var(--border);color:var(--text);
+          padding:9px 12px;border-radius:8px;font-size:.86rem">
+      </div>
+      <div style="flex:1">
+        <div style="font-size:.74rem;color:var(--muted);margin-bottom:4px">Current RAM (optional)</div>
+        <input type="text" id="tshirt-current-ram" placeholder="e.g. 16 GB"
+          style="width:100%;background:var(--surf2);border:1px solid var(--border);color:var(--text);
+          padding:9px 12px;border-radius:8px;font-size:.86rem">
+      </div>
+    </div>
+    <div style="display:flex;gap:10px;margin-bottom:10px">
+      <div style="flex:1">
+        <div style="font-size:.74rem;color:var(--muted);margin-bottom:4px">New CPU</div>
+        <input type="text" id="tshirt-new-cpu" placeholder="e.g. 8 vCPU"
+          style="width:100%;background:var(--surf2);border:1px solid var(--border);color:var(--text);
+          padding:9px 12px;border-radius:8px;font-size:.86rem">
+      </div>
+      <div style="flex:1">
+        <div style="font-size:.74rem;color:var(--muted);margin-bottom:4px">New RAM</div>
+        <input type="text" id="tshirt-new-ram" placeholder="e.g. 32 GB"
+          style="width:100%;background:var(--surf2);border:1px solid var(--border);color:var(--text);
+          padding:9px 12px;border-radius:8px;font-size:.86rem">
+      </div>
+    </div>
+    <div style="font-size:.74rem;color:var(--muted);margin-bottom:4px">Reason (optional)</div>
+    <input type="text" id="tshirt-reason" placeholder="e.g. Application load increased, approved by project lead"
+      style="width:100%;background:var(--surf2);border:1px solid var(--border);color:var(--text);
+      padding:9px 12px;border-radius:8px;font-size:.86rem;margin-bottom:14px">
+
+    <button class="btn" style="background:var(--cyan);color:#000" onclick="submitTshirt()">👕 Submit for Review</button>
+    <div id="tshirt-msg" style="margin-top:12px"></div>
+
+    <div class="shdr" style="margin-top:24px;color:var(--cyan)">My Submitted CPU/RAM Changes</div>
+    <div id="tshirt-my-list"></div>
+  </div>
+</div>
+
 <!-- UPLOAD (admin) -->
 <div class="page" id="page-upload">
   <div class="shdr">📤 Upload Inventory File</div>
@@ -2472,6 +2779,32 @@ tr:hover td{background:var(--surf2)}
       <div id="newsrv-pending-table"></div>
       <div id="newsrv-approved-table" style="display:none"></div>
       <div id="newsrv-rejected-table" style="display:none"></div>
+    </div>
+
+    <!-- ── T-SHIRT SIZE CHANGES ── -->
+    <div style="margin-top:20px">
+      <div class="shdr" style="color:var(--cyan)">
+        👕 CPU / RAM (T-Shirt Size) Changes — EMA / EPMC / JEA
+        <span id="tshirt-pending-badge" style="display:none;margin-left:8px;
+          background:var(--cyan);color:#000;border-radius:99px;padding:1px 9px;
+          font-size:.72rem">0 pending</span>
+        <a href="/admin/tshirt_report" style="float:right">
+          <button class="btn btn-xs" style="background:var(--cyan);color:#000">📥 Export All</button></a>
+      </div>
+      <div style="display:flex;gap:6px;margin-bottom:12px">
+        <button class="btn btn-sm" id="tshirt-tab-pending"
+          onclick="showTshirtTab('pending')" style="background:var(--cyan);color:#000">
+          ⏳ Pending <span id="tshirt-pending-count"></span></button>
+        <button class="btn btn-sm btn-outline" id="tshirt-tab-approved"
+          onclick="showTshirtTab('approved')">
+          ✅ Approved <span id="tshirt-approved-count"></span></button>
+        <button class="btn btn-sm btn-outline" id="tshirt-tab-rejected"
+          onclick="showTshirtTab('rejected')">
+          ❌ Rejected <span id="tshirt-rejected-count"></span></button>
+      </div>
+      <div id="tshirt-pending-table"></div>
+      <div id="tshirt-approved-table" style="display:none"></div>
+      <div id="tshirt-rejected-table" style="display:none"></div>
     </div>
 
     <!-- ── FLAGS ── -->
@@ -2643,8 +2976,10 @@ async function init(){
   if(localStorage.getItem('theme')==='light') document.body.classList.add('light');
   const r = await fetch('/me').then(x=>x.json());
   ME = r;
-  if(r.decom_reasons)  _decomReasons  = r.decom_reasons;
-  if(r.newsrv_fields)  _newsrvFields  = r.newsrv_fields;
+  if(r.decom_reasons)     _decomReasons      = r.decom_reasons;
+  if(r.newsrv_fields)     _newsrvFields      = r.newsrv_fields;
+  if(r.preset_tags)       PRESET_TAGS        = r.preset_tags;
+  if(r.tshirt_platforms)  _tshirtPlatforms   = r.tshirt_platforms;
   renderUserArea();
   renderSidebar();
   loadDashboard();
@@ -2677,6 +3012,7 @@ function renderSidebar(){
     show('nav-report-section', true);
     show('nav-decom', true);
     show('nav-newsrv', true);
+    show('nav-tshirt', true);
   }
   if(ME.role === 'admin'){
     show('nav-admin-section', true);
@@ -2719,6 +3055,7 @@ function showPage(name, el){
   if(name==='activity')  loadActivity();
   if(name==='decom')     loadDecomPage();
   if(name==='newsrv')    loadNewsrvPage();
+  if(name==='tshirt')    loadTshirtPage();
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -2860,7 +3197,13 @@ function renderSearchTable(rows, scol){
 function renderMiniTags(tags, noteCount, flagged){
   let h='';
   if(flagged) h+=`<span class="badge" style="background:rgba(255,79,106,.15);color:var(--red);border:1px solid rgba(255,79,106,.3);margin:1px">🚩</span>`;
-  (tags||[]).forEach(t=>{ h+=`<span class="tag-pill" style="font-size:.65rem;padding:1px 6px">${esc(t)}</span>`; });
+  (tags||[]).forEach(t=>{
+    const label = t.tag || t;  // supports both rich objects and legacy strings
+    const isAccepted = t.status === 'Accepted';
+    const dot = t.status ? (isAccepted ? '✓ ' : '? ') : '';
+    h+=`<span class="tag-pill" style="font-size:.65rem;padding:1px 6px;
+      ${isAccepted?'':'opacity:.75;border-style:dashed'}" title="${isAccepted?'Accepted':'Unverified — pending admin review'}">${dot}${esc(label)}</span>`;
+  });
   if(noteCount) h+=`<span class="badge badge-other" style="margin:1px">📝${noteCount}</span>`;
   return h||'<span style="color:var(--dim);font-size:.72rem">—</span>';
 }
@@ -3071,11 +3414,20 @@ function renderModalTags(tags, d){
   const el=document.getElementById('modal-tags');
   const editor=document.getElementById('modal-tag-editor');
   const presetEl=document.getElementById('modal-preset-tags');
-  // Show existing tags
+  // Show existing tags — each as a rich object {id, tag, user, name, ts, status}
   if(tags.length){
     el.innerHTML=tags.map(t=>{
-      const rm=ME.logged_in?`<span class="rm" onclick="removeTag('${esc(t)}')">✕</span>`:'';
-      return `<span class="tag-pill">${esc(t)}${rm}</span>`;
+      const isAccepted = t.status === 'Accepted';
+      const canRemove  = ME.logged_in && (ME.role==='admin' || ME.username===t.user);
+      const canAccept  = ME.role==='admin' && !isAccepted;
+      const rm = canRemove ? `<span class="rm" onclick="removeTagById('${t.id}')">✕</span>` : '';
+      const accept = canAccept ? `<span class="rm" style="color:var(--green)"
+        title="Accept as official" onclick="acceptTagById('${t.id}')">✓</span>` : '';
+      const statusDot = isAccepted
+        ? `<span style="color:var(--green);font-size:.65rem" title="Accepted by ${esc(t.accepted_by||'')}">✓</span>`
+        : `<span style="color:var(--yellow);font-size:.65rem" title="Unverified — submitted by ${esc(t.name||t.user||'')}">?</span>`;
+      return `<span class="tag-pill" style="${isAccepted?'':'border-style:dashed;opacity:.85'}">
+        ${statusDot} ${esc(t.tag)}${accept}${rm}</span>`;
     }).join('');
   } else {
     el.innerHTML=`<span style="color:var(--dim);font-size:.8rem">No tags yet</span>`;
@@ -3083,7 +3435,7 @@ function renderModalTags(tags, d){
   // Show editor only if logged in
   if(ME.logged_in){
     editor.style.display='';
-    const usedSet=new Set(tags);
+    const usedSet=new Set(tags.map(t=>t.tag));
     presetEl.innerHTML=PRESET_TAGS.map(t=>{
       const used=usedSet.has(t);
       return `<span class="chip ${used?'active':''}" style="font-size:.72rem"
@@ -3091,7 +3443,6 @@ function renderModalTags(tags, d){
     }).join('');
   } else {
     editor.style.display='none';
-    // show login notice if no tags
     if(!tags.length) el.innerHTML=loginNotice('tag this server');
   }
 }
@@ -3242,8 +3593,14 @@ function closeModalOuter(e){
 
 // ── Tag actions ──
 async function togglePresetTag(tag, isUsed){
-  if(isUsed==='true') await removeTag(tag);
-  else await addTagToServer(tag);
+  if(isUsed==='true'){
+    // find the tag's id from current modal state to remove it
+    const r = await fetch(`/detail?hostname=${encodeURIComponent(_modalHostname)}`).then(x=>x.json());
+    const existing = (r._tags||[]).find(t=>t.tag===tag);
+    if(existing) await removeTagById(existing.id);
+  } else {
+    await addTagToServer(tag);
+  }
 }
 async function addCustomTag(){
   const inp=document.getElementById('custom-tag-input');
@@ -3257,15 +3614,21 @@ async function addTagToServer(tag){
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({hostname:_modalHostname,tag})}).then(x=>x.json());
   if(r.error){ alert(r.error); return; }
-  PRESET_TAGS = PRESET_TAGS; // unchanged
-  document.getElementById('modal-tags').innerHTML='';
   renderModalTags(r.tags, {});
   refreshRowTags(_modalHostname, r.tags);
 }
-async function removeTag(tag){
+async function removeTagById(tagId){
   const r=await fetch('/tag/remove',{method:'POST',
     headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({hostname:_modalHostname,tag})}).then(x=>x.json());
+    body:JSON.stringify({hostname:_modalHostname,id:tagId})}).then(x=>x.json());
+  if(r.error){ alert(r.error); return; }
+  renderModalTags(r.tags, {});
+  refreshRowTags(_modalHostname, r.tags);
+}
+async function acceptTagById(tagId){
+  const r=await fetch('/admin/tag/accept',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({hostname:_modalHostname,id:tagId})}).then(x=>x.json());
   if(r.error){ alert(r.error); return; }
   renderModalTags(r.tags, {});
   refreshRowTags(_modalHostname, r.tags);
@@ -3521,6 +3884,12 @@ function loadAdmin(){
       <div class="admin-card">
         <div class="num c-green">${d.newsrv_approved}</div>
         <div class="lbl">Approved New Servers</div></div>
+      <div class="admin-card">
+        <div class="num c-cyan">${d.tshirt_pending}</div>
+        <div class="lbl">Pending CPU/RAM Changes</div></div>
+      <div class="admin-card">
+        <div class="num c-green">${d.tshirt_approved}</div>
+        <div class="lbl">Approved CPU/RAM Changes</div></div>
       ${d.quality&&Object.keys(d.quality).length?
         `<div class="admin-card" style="text-align:left;grid-column:1/-1">
           <div class="quality-panel"><h4>⚠️ Data Quality</h4>
@@ -3529,7 +3898,7 @@ function loadAdmin(){
           ).join('')}</div></div>`:''}`;
 
     // ── Monthly Changes (Approved items, ready to apply) ──
-    const totalApproved = (d.corr_approved||0) + (d.decom_approved||0) + (d.newsrv_approved||0);
+    const totalApproved = (d.corr_approved||0) + (d.decom_approved||0) + (d.newsrv_approved||0) + (d.tshirt_approved||0);
     const mcEl = document.getElementById('monthly-changes-banner');
     if(mcEl){
       mcEl.innerHTML = totalApproved
@@ -3580,6 +3949,19 @@ function loadAdmin(){
     renderNewsrvTable('newsrv-approved-table', nsApproved, 'approved');
     renderNewsrvTable('newsrv-rejected-table', nsRejected, 'rejected');
 
+    // ── T-Shirt Size Changes ──
+    const tsPending  = (d.tshirt_changes||[]).filter(c=>c.status==='Pending');
+    const tsApproved = (d.tshirt_changes||[]).filter(c=>c.status==='Approved');
+    const tsRejected = (d.tshirt_changes||[]).filter(c=>c.status==='Rejected');
+    const tsBadge = document.getElementById('tshirt-pending-badge');
+    if(tsBadge){ tsBadge.style.display=tsPending.length?'':'none'; tsBadge.textContent=`${tsPending.length} pending`; }
+    document.getElementById('tshirt-pending-count').textContent=`(${tsPending.length})`;
+    document.getElementById('tshirt-approved-count').textContent=`(${tsApproved.length})`;
+    document.getElementById('tshirt-rejected-count').textContent=`(${tsRejected.length})`;
+    renderTshirtTable('tshirt-pending-table', tsPending, 'pending');
+    renderTshirtTable('tshirt-approved-table', tsApproved, 'approved');
+    renderTshirtTable('tshirt-rejected-table', tsRejected, 'rejected');
+
     // ── Flags ──
     const flags = d.flag_rows||[];
     const flagEl = document.getElementById('admin-flags');
@@ -3608,19 +3990,28 @@ function loadAdmin(){
     if(!tagRows.length){
       tagEl.innerHTML='<div class="alert alert-info">No tags added yet.</div>';
     } else {
+      const unverifiedCount = tagRows.filter(r=>r.status==='Unverified').length;
       tagEl.innerHTML=`<div style="font-size:.78rem;color:var(--muted);margin-bottom:6px">
-        ${tagRows.length} tag entries across ${new Set(tagRows.map(r=>r.hostname)).size} servers</div>
+        ${tagRows.length} tag entries across ${new Set(tagRows.map(r=>r.hostname)).size} servers
+        ${unverifiedCount?` · <span style="color:var(--yellow)">${unverifiedCount} unverified</span>`:''}</div>
         <div class="tbl-wrap"><table>
-        <thead><tr><th>Hostname</th><th>Tag</th><th>Platform</th>
-          <th>Server Role</th><th>OS</th><th>DC Location</th></tr></thead>
+        <thead><tr><th>Hostname</th><th>Tag</th><th>Status</th><th>Submitted By</th>
+          <th>Platform</th><th>Server Role</th><th>OS</th><th>Action</th></tr></thead>
         <tbody>${tagRows.map(r=>`<tr>
           <td style="font-weight:700;color:var(--blue);font-family:monospace;cursor:pointer"
-            onclick="showDetail('${esc(r.hostname)}')">${esc(r.hostname)}</td>
-          <td><span class="tag-pill">${esc(r.tag)}</span></td>
+            onclick="showDetail('${esc(r.hostname)}')">${esc(r.tag.length?r.hostname:r.hostname)}</td>
+          <td><span class="tag-pill" style="${r.status==='Accepted'?'':'border-style:dashed;opacity:.85'}">${esc(r.tag)}</span></td>
+          <td>${r.status==='Accepted'
+            ?`<span class="badge badge-live">✓ Accepted</span>`
+            :`<span class="badge" style="background:rgba(255,194,64,.15);color:var(--yellow);border-color:rgba(255,194,64,.3)">? Unverified</span>`}</td>
+          <td style="font-size:.78rem">${esc(r.name||r.user||'—')}<br><span style="font-size:.7rem;color:var(--muted)">${esc(r.ts||'')}</span></td>
           <td style="font-size:.8rem">${esc(r.platform)}</td>
           <td style="font-size:.8rem">${esc(r.role)}</td>
           <td style="font-size:.78rem">${esc(r.os)}</td>
-          <td style="font-size:.78rem">${esc(r.dc)}</td>
+          <td style="display:flex;gap:5px">
+            ${r.status!=='Accepted'?`<button class="btn btn-xs btn-green" onclick="adminAcceptTag('${esc(r.hn_key)}','${r.id}')">✓ Accept</button>`:''}
+            <button class="btn btn-xs btn-red" onclick="adminRemoveTag('${esc(r.hn_key)}','${r.id}')">🗑 Remove</button>
+          </td>
         </tr>`).join('')}</tbody></table></div>`;
     }
 
@@ -3815,6 +4206,58 @@ async function deleteNewsrv(id, btn){
   if(r.ok) loadAdmin();
 }
 
+// ── T-Shirt size (CPU/RAM) admin table ──
+function renderTshirtTable(containerId, rows, mode){
+  const el=document.getElementById(containerId);
+  if(!rows.length){
+    const msg = {pending:'No pending CPU/RAM change requests — all clear! ✅',
+                 approved:'No approved CPU/RAM changes yet.',
+                 rejected:'No rejected CPU/RAM changes.'}[mode];
+    el.innerHTML=`<div class="alert ${mode==='pending'?'alert-info':'alert-success'}">${msg}</div>`;
+    return;
+  }
+  const isPending = mode === 'pending';
+  el.innerHTML=`<div class="tbl-wrap"><table>
+    <thead><tr>
+      <th>Hostname</th><th>Platform</th><th>Current CPU/RAM</th><th>New CPU/RAM</th>
+      <th>Reason</th><th>Submitted By</th><th>Date</th>
+      ${isPending?'<th>Actions</th>':'<th>Decision By</th><th>Decision Note</th>'}
+    </tr></thead>
+    <tbody>${rows.map(r=>`<tr>
+      <td style="font-weight:700;color:var(--blue);font-family:monospace;cursor:pointer"
+        onclick="showDetail('${esc(r.hostname)}')">${esc(r.hostname)}</td>
+      <td><span class="badge badge-other">${esc(r.platform)}</span></td>
+      <td style="font-size:.78rem;color:var(--red)">${esc(r.current_cpu||'—')} / ${esc(r.current_ram||'—')}</td>
+      <td style="font-size:.78rem;color:var(--green);font-weight:600">${esc(r.new_cpu||'—')} / ${esc(r.new_ram||'—')}</td>
+      <td style="font-size:.76rem;color:var(--muted);max-width:160px;white-space:normal">${esc(r.reason||'—')}</td>
+      <td style="font-size:.76rem">${esc(r.name)}</td>
+      <td style="font-size:.74rem;color:var(--muted)">${esc(r.ts)}</td>
+      ${isPending
+        ?`<td style="display:flex;gap:5px">
+          <button class="btn btn-xs btn-green" onclick="openDecisionModal('tshirt','${r.id}','${esc(r.hostname)}')">⚖️ Review</button>
+          <button class="btn btn-xs btn-red"   onclick="deleteTshirt('${r.id}',this)">🗑 Delete</button>
+        </td>`
+        :`<td style="font-size:.74rem">${esc(r.reviewed_by||'—')} · ${esc(r.reviewed_ts||'')}</td>
+          <td style="font-size:.74rem;color:var(--muted)">${esc(r.decision_reason||'—')}</td>`}
+    </tr>`).join('')}</tbody></table></div>`;
+}
+function showTshirtTab(tab){
+  ['pending','approved','rejected'].forEach(t=>{
+    document.getElementById(`tshirt-${t}-table`).style.display = (t===tab)?'':'none';
+    const btn = document.getElementById(`tshirt-tab-${t}`);
+    btn.className = (t===tab) ? 'btn btn-sm' : 'btn btn-sm btn-outline';
+    btn.style.background = (t===tab) ? {pending:'var(--cyan)',approved:'var(--green)',rejected:'var(--red)'}[t] : '';
+    btn.style.color = (t===tab) ? (t==='rejected'?'#fff':'#000') : '';
+  });
+}
+async function deleteTshirt(id, btn){
+  if(!confirm('Delete this CPU/RAM change request?')) return;
+  btn.disabled=true;
+  const r=await fetch('/admin/tshirt/delete',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({id})}).then(x=>x.json());
+  if(r.ok) loadAdmin();
+}
+
 // ── Shared Approve/Reject decision modal ──
 let _decisionTarget = {type:'', id:'', hostname:''};
 let _decisionChoice = '';
@@ -3855,6 +4298,7 @@ async function submitDecisionModal(){
     correction: '/admin/correction/review',
     decommission: '/admin/decommission/review',
     newserver: '/admin/newserver/review',
+    tshirt: '/admin/tshirt/review',
   };
   const r = await fetch(endpoints[_decisionTarget.type], {method:'POST',
     headers:{'Content-Type':'application/json'},
@@ -3880,6 +4324,18 @@ async function adminDeleteNote(hostname, noteId, btn){
 async function adminUnflag(hostname){
   await fetch('/flag/remove',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({hostname})});
+  loadAdmin();
+}
+
+async function adminAcceptTag(hostnameKey, tagId){
+  await fetch('/admin/tag/accept',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({hostname:hostnameKey,id:tagId})});
+  loadAdmin();
+}
+async function adminRemoveTag(hostnameKey, tagId){
+  if(!confirm('Remove this tag?')) return;
+  await fetch('/tag/remove',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({hostname:hostnameKey,id:tagId})});
   loadAdmin();
 }
 
@@ -4210,6 +4666,115 @@ function renderMyNewsrvList(mine){
 }
 
 // ════════════════════════════════════════════════════════════════
+//  UPDATE CPU / RAM (T-SHIRT SIZE)
+// ════════════════════════════════════════════════════════════════
+let _tshirtPlatforms = ['EMA','EPMC','JEA'];
+let _tshirtSelected = null;   // {hostname, platform}
+
+function loadTshirtPage(){
+  document.getElementById('tshirt-hostname').value = '';
+  document.getElementById('tshirt-host-suggest').innerHTML = '';
+  document.getElementById('tshirt-host-selected').innerHTML = '';
+  document.getElementById('tshirt-current-cpu').value = '';
+  document.getElementById('tshirt-current-ram').value = '';
+  document.getElementById('tshirt-new-cpu').value = '';
+  document.getElementById('tshirt-new-ram').value = '';
+  document.getElementById('tshirt-reason').value = '';
+  document.getElementById('tshirt-msg').innerHTML = '';
+  _tshirtSelected = null;
+  loadMyTshirtChanges();
+}
+
+let _tshirtDebTimer;
+function tshirtHostSearch(){
+  clearTimeout(_tshirtDebTimer);
+  const q = document.getElementById('tshirt-hostname').value.trim();
+  if(q.length < 2){ document.getElementById('tshirt-host-suggest').innerHTML=''; return; }
+  _tshirtDebTimer = setTimeout(()=>{
+    fetch('/search?q='+encodeURIComponent(q)+'&page=1').then(r=>r.json()).then(d=>{
+      // Only show servers on EMA / EPMC / JEA — the platforms whose pricing depends on T-shirt size
+      const rows = (d.rows||[]).filter(r=>_tshirtPlatforms.includes(r['Platform'])).slice(0,6);
+      if(!rows.length){
+        document.getElementById('tshirt-host-suggest').innerHTML =
+          `<div style="font-size:.78rem;color:var(--muted);padding:6px 0">
+            No matching ${_tshirtPlatforms.join('/')} servers found. T-shirt size changes only apply to these platforms.</div>`;
+        return;
+      }
+      document.getElementById('tshirt-host-suggest').innerHTML =
+        `<div style="border:1px solid var(--border);border-radius:8px;overflow:hidden">
+        ${rows.map(r=>`<div style="padding:7px 12px;cursor:pointer;font-size:.83rem;
+          font-family:monospace;border-bottom:1px solid var(--border)"
+          onmouseover="this.style.background='var(--surf2)'" onmouseout="this.style.background=''"
+          onclick="pickTshirtHost('${esc(r['Server HostName'])}','${esc(r['Platform']||'')}')">${esc(r['Server HostName'])}
+          <span style="color:var(--muted);font-family:inherit;font-size:.78rem"> — ${esc(r['Platform']||'')}</span>
+        </div>`).join('')}</div>`;
+    });
+  }, 300);
+}
+function pickTshirtHost(hostname, platform){
+  _tshirtSelected = {hostname, platform};
+  document.getElementById('tshirt-hostname').value = hostname;
+  document.getElementById('tshirt-host-suggest').innerHTML = '';
+  document.getElementById('tshirt-host-selected').innerHTML =
+    `<div style="font-size:.78rem;color:var(--green)">✓ Selected: ${esc(hostname)}
+      <span class="badge badge-other" style="margin-left:6px">${esc(platform)}</span></div>`;
+}
+
+async function submitTshirt(){
+  const msg = document.getElementById('tshirt-msg');
+  if(!_tshirtSelected){
+    msg.innerHTML = '<div class="alert alert-warn">Please search and select a server first.</div>';
+    return;
+  }
+  const cc  = document.getElementById('tshirt-current-cpu').value.trim();
+  const cr  = document.getElementById('tshirt-current-ram').value.trim();
+  const nc  = document.getElementById('tshirt-new-cpu').value.trim();
+  const nr  = document.getElementById('tshirt-new-ram').value.trim();
+  const rsn = document.getElementById('tshirt-reason').value.trim();
+  if(!nc && !nr){
+    msg.innerHTML = '<div class="alert alert-warn">Provide a new CPU or new RAM value.</div>';
+    return;
+  }
+  const r = await fetch('/tshirt/add',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({
+      hostname:_tshirtSelected.hostname, platform:_tshirtSelected.platform,
+      current_cpu:cc, current_ram:cr, new_cpu:nc, new_ram:nr, reason:rsn
+    })}).then(x=>x.json());
+  if(r.error){ msg.innerHTML=`<div class="alert alert-error">${esc(r.error)}</div>`; return; }
+  msg.innerHTML = '<div class="alert alert-success">✅ Submitted! Admin will review and reconcile with billing.</div>';
+  loadTshirtPage();
+}
+
+function loadMyTshirtChanges(){
+  fetch('/admin/data').then(r=>{
+    if(r.status===403){ document.getElementById('tshirt-my-list').innerHTML=''; return null; }
+    return r.json();
+  }).then(d=>{
+    if(!d) return;
+    const mine = (d.tshirt_changes||[]).filter(x=>x.user===ME.username);
+    renderMyTshirtList(mine);
+  }).catch(()=>{});
+}
+function renderMyTshirtList(mine){
+  const el = document.getElementById('tshirt-my-list');
+  if(!mine.length){ el.innerHTML = '<div style="color:var(--dim);font-size:.82rem">No submissions yet.</div>'; return; }
+  el.innerHTML = `<div class="tbl-wrap"><table>
+    <thead><tr><th>Hostname</th><th>Platform</th><th>Current CPU/RAM</th><th>New CPU/RAM</th>
+      <th>Reason</th><th>Submitted</th><th>Status</th><th>Admin Note</th></tr></thead>
+    <tbody>${mine.map(m=>`<tr>
+      <td style="font-weight:700;color:var(--blue);font-family:monospace">${esc(m.hostname)}</td>
+      <td><span class="badge badge-other">${esc(m.platform)}</span></td>
+      <td style="font-size:.78rem;color:var(--red)">${esc(m.current_cpu||'—')} / ${esc(m.current_ram||'—')}</td>
+      <td style="font-size:.78rem;color:var(--green);font-weight:600">${esc(m.new_cpu||'—')} / ${esc(m.new_ram||'—')}</td>
+      <td style="font-size:.76rem;color:var(--muted)">${esc(m.reason||'—')}</td>
+      <td style="font-size:.74rem;color:var(--muted)">${esc(m.ts)}</td>
+      <td>${reviewStatusBadge(m.status)}</td>
+      <td style="font-size:.76rem;color:var(--muted)">${esc(m.decision_reason||'—')}</td>
+    </tr>`).join('')}</tbody></table></div>`;
+}
+
+// ════════════════════════════════════════════════════════════════
 //  ACTIVITY PAGE (logged-in users)
 // ════════════════════════════════════════════════════════════════
 function loadActivity(){
@@ -4218,23 +4783,35 @@ function loadActivity(){
     el.innerHTML='<div class="alert alert-info">Please <a href="/login">log in</a> to view your activity.</div>';
     return;
   }
-  fetch('/admin/data').then(r=>r.json()).then(d=>{
-    window._correctable_cols = d.correctable_cols||[];
-    PRESET_TAGS = d.preset_tags||[];
-    const myCorrs=(d.corrections||[]).filter(c=>c.user===ME.username);
-    const myTags = (d.tag_rows||[]).filter(r=>false); // tags don't track who added yet
-    const myNotes=(d.note_rows||[]).filter(n=>n.user===ME.username);
+  fetch('/my_activity').then(r=>r.json()).then(d=>{
+    const myTags  = d.my_tags||[];
+    const myNotes = d.my_notes||[];
+    const myCorrs = d.my_corrections||[];
     let html=`
       <div class="metrics-row" style="max-width:600px">
-        <div class="metric-card"><div class="metric-val c-purple">${d.tag_count}</div>
-          <div class="metric-lbl">Total Tags (all)</div></div>
-        <div class="metric-card"><div class="metric-val c-blue">${myNotes.length}</div>
+        <div class="metric-card"><div class="metric-val c-purple">${d.my_tag_count}</div>
+          <div class="metric-lbl">My Tags</div></div>
+        <div class="metric-card"><div class="metric-val c-blue">${d.my_note_count}</div>
           <div class="metric-lbl">My Notes</div></div>
-        <div class="metric-card"><div class="metric-val c-orange">${myCorrs.length}</div>
+        <div class="metric-card"><div class="metric-val c-orange">${d.my_corr_count}</div>
           <div class="metric-lbl">My Corrections</div></div>
-        <div class="metric-card"><div class="metric-val c-red">${d.flag_count}</div>
-          <div class="metric-lbl">Total Flags</div></div>
       </div>`;
+
+    // My tags
+    if(myTags.length){
+      html+=`<div class="shdr" style="color:var(--purple);margin-top:16px">🏷️ My Tags</div>
+        <div class="tbl-wrap"><table>
+        <thead><tr><th>Hostname</th><th>Tag</th><th>Status</th><th>Submitted</th></tr></thead>
+        <tbody>${myTags.map(t=>`<tr>
+          <td style="font-weight:700;color:var(--blue);font-family:monospace;cursor:pointer"
+            onclick="showDetail('${esc(t.hostname)}')">${esc(t.hostname)}</td>
+          <td><span class="tag-pill" style="${t.status==='Accepted'?'':'border-style:dashed;opacity:.85'}">${esc(t.tag)}</span></td>
+          <td>${t.status==='Accepted'
+            ?'<span class="badge badge-live">✓ Accepted</span>'
+            :'<span class="badge" style="background:rgba(255,194,64,.15);color:var(--yellow);border-color:rgba(255,194,64,.3)">? Unverified</span>'}</td>
+          <td style="font-size:.74rem;color:var(--muted)">${esc(t.ts)}</td>
+        </tr>`).join('')}</tbody></table></div>`;
+    }
 
     // My corrections
     if(myCorrs.length){
@@ -4266,6 +4843,11 @@ function loadActivity(){
           <td style="font-size:.78rem">${esc(n.platform)}</td>
           <td style="font-size:.74rem;color:var(--muted)">${esc(n.ts)}</td>
         </tr>`).join('')}</tbody></table></div>`;
+    }
+
+    if(!myTags.length && !myCorrs.length && !myNotes.length){
+      html+=`<div class="alert alert-info" style="max-width:540px;margin-top:8px">
+        You haven't submitted anything yet.</div>`;
     }
 
     html+=`<div class="alert alert-info" style="max-width:540px;margin-top:16px">
