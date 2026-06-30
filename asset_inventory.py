@@ -247,10 +247,12 @@ def make_hbar_compare(labels, vals_a, vals_b, label_a="Current",
 #  COLUMN DETECTION
 # ═══════════════════════════════════════════════════════════════════════════════
 COL_MAP = {
-    "Server HostName":               ["server hostname","hostname","host name","servername"],
+    "Server HostName":               ["server hostname","hostname","host name","servername",
+                                      "server host name"],
     "Server Type(Physical/Virtual)": ["server type","server type(physical/virtual)",
+                                      "server type (physical/virtual)",
                                       "physical/virtual","type"],
-    "Platform":                      ["platform","infra","infrastructure"],
+    "Platform":                      ["platform","plateform","infra","infrastructure"],
     "Server DC Location":            ["server dc location","dc location","datacenter",
                                       "data center","location"],
     "HPC or NON HPC or JPC":         ["hpc or non hpc or jpc","hpc/non hpc/jpc","hpc","group"],
@@ -269,11 +271,21 @@ def detect_status_col(columns):
             return col
     return None
 
+def _clean_header_key(col):
+    """Normalise a raw header into a matchable key: lowercase, strip
+    surrounding whitespace, trailing colons, and collapse internal
+    whitespace. Handles real-world headers like 'Server Role:',
+    'Reference : ', 'HPC or NON HPC or JPC  :' etc."""
+    key = str(col).strip().lower()
+    key = key.rstrip(":").strip()          # drop trailing colon(s)
+    key = re.sub(r"\s+", " ", key)          # collapse multi-space
+    return key
+
 def normalise_columns(df):
     df.columns = [str(c).strip() for c in df.columns]
     rename, used = {}, set()
     for col in df.columns:
-        key = col.lower().strip()
+        key = _clean_header_key(col)
         for canon, aliases in COL_MAP.items():
             if canon in used: continue
             if key in aliases or key == canon.lower():
@@ -641,6 +653,7 @@ app = Flask(__name__)
 app.secret_key = secret
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
 app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.json.sort_keys = False   # preserve column order (Server HostName first) in JSON responses
 
 # ── Auth routes ───────────────────────────────────────────────────────────────
 @app.route("/login", methods=["GET", "POST"])
@@ -977,6 +990,8 @@ def bulk():
 
 # ── Public: compare ───────────────────────────────────────────────────────────
 @app.route("/compare")
+@_login_required
+@_admin_required
 def compare():
     dc = STORE["df"]; dp = STORE["df_prev"]
     if dc is None or dp is None:
@@ -1949,8 +1964,6 @@ tr:hover td{background:var(--surf2)}
     <span class="nav-icon">🗂️</span> Grouped Summary</div>
   <div class="nav-item" onclick="showPage('bulk',this)">
     <span class="nav-icon">📋</span> Bulk Lookup</div>
-  <div class="nav-item" onclick="showPage('compare',this)">
-    <span class="nav-icon">📈</span> Month Compare</div>
 
   <div class="nav-section" id="nav-user-section" style="display:none">Logged In</div>
   <div class="nav-item" id="nav-activity" style="display:none"
@@ -1969,6 +1982,9 @@ tr:hover td{background:var(--surf2)}
   <div class="nav-item" id="nav-upload" style="display:none"
        onclick="showPage('upload',this)">
     <span class="nav-icon">📤</span> Upload Data</div>
+  <div class="nav-item" id="nav-compare" style="display:none"
+       onclick="showPage('compare',this)">
+    <span class="nav-icon">📈</span> Month Compare</div>
   <div class="nav-item" id="nav-admin" style="display:none"
        onclick="showPage('admin',this)">
     <span class="nav-icon">⚙️</span> Admin Panel
@@ -2011,7 +2027,7 @@ tr:hover td{background:var(--surf2)}
       <input type="text" id="f-q" placeholder="Type to search…" oninput="debSearch()"></div>
     <div><label>Platform</label>
       <select id="f-platform" onchange="runSearch(1)"><option value="">All</option></select></div>
-    <div><label>Status</label>
+    <div><label title="Live = server is in BAU. Not Live = server is in project/testing phase, before operational acceptance into BAU.">Status ℹ️</label>
       <select id="f-status" onchange="runSearch(1)"><option value="">All</option></select></div>
     <div><label>Server Role</label>
       <select id="f-role" onchange="runSearch(1)"><option value="">All</option></select></div>
@@ -2475,6 +2491,7 @@ function renderSidebar(){
   if(ME.role === 'admin'){
     show('nav-admin-section', true);
     show('nav-upload', true);
+    show('nav-compare', true);
     show('nav-admin', true);
     show('nav-users', true);
     const totalPending = (ME.pending_corrections||0) + (ME.pending_decommissions||0) + (ME.pending_newservers||0);
@@ -2494,6 +2511,11 @@ function toggleTheme(){
 }
 
 function showPage(name, el){
+  const adminOnlyPages = ['compare','upload','admin','users'];
+  if(adminOnlyPages.includes(name) && ME.role !== 'admin'){
+    name = 'dashboard';
+    el = document.querySelector('.nav-item[onclick*="dashboard"]');
+  }
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
   document.getElementById('page-'+name).classList.add('active');
@@ -2531,7 +2553,7 @@ function loadDashboard(){
       <div class="metric-card"><div class="metric-val c-green">${m.live.toLocaleString()}</div>
         <div class="metric-lbl">Live (BAU)</div></div>
       <div class="metric-card"><div class="metric-val c-red">${m.not_live.toLocaleString()}</div>
-        <div class="metric-lbl">Not Live</div></div>
+        <div class="metric-lbl">Not Live (Project Phase)</div></div>
       <div class="metric-card"><div class="metric-val c-cyan">${m.physical.toLocaleString()}</div>
         <div class="metric-lbl">Physical</div></div>
       <div class="metric-card"><div class="metric-val c-purple">${m.virtual.toLocaleString()}</div>
@@ -2834,7 +2856,7 @@ function showDetail(hostname){
     if(!d||!Object.keys(d).length) return;
     document.getElementById('modal-hostname').textContent = d['Server HostName']||hostname;
     // Detail grid
-    const scol=d['_status_col']||'', skip=new Set(['_status_col','_status_val','_tags','_notes','_flag']);
+    const scol=d['_status_col']||'', skip=new Set(['_status_col','_status_val','_tags','_notes','_flag','_correctable_cols']);
     const full=['Application Name','Reference','Commercial Category'];
     let html='';
     Object.entries(d).forEach(([k,v])=>{
@@ -3195,7 +3217,7 @@ function runCompare(){
       <div class="diff-card"><div class="diff-val c-cyan">${(d.to_live||[]).length}</div>
         <div class="diff-lbl">Went Live</div></div>
       <div class="diff-card"><div class="diff-val c-orange">${(d.to_not_live||[]).length}</div>
-        <div class="diff-lbl">Left BAU</div></div>
+        <div class="diff-lbl">Moved to Project Phase</div></div>
     </div>`;
     if(d.charts){
       h+='<div class="charts-grid">';
@@ -3205,8 +3227,8 @@ function runCompare(){
       });
       h+='</div>';
     }
-    if(d.to_live&&d.to_live.length)      h+=cmpTable('✅ Went Live this month',d.to_live,'var(--green)');
-    if(d.to_not_live&&d.to_not_live.length) h+=cmpTable('⚠️ Left BAU (Live→Not Live)',d.to_not_live,'var(--orange)');
+    if(d.to_live&&d.to_live.length)      h+=cmpTable('✅ Went Live this month (now in BAU)',d.to_live,'var(--green)');
+    if(d.to_not_live&&d.to_not_live.length) h+=cmpTable('⚠️ Moved back to Project Phase (Live→Not Live)',d.to_not_live,'var(--orange)');
     if(d.new_servers&&d.new_servers.length)  h+=cmpTable('🆕 New Servers',d.new_servers,'var(--blue)');
     if(d.removed_servers&&d.removed_servers.length) h+=cmpTable('🗑️ Removed Servers',d.removed_servers,'var(--red)');
     document.getElementById('compare-out').innerHTML=h;
