@@ -46,6 +46,11 @@ _FLAGS_FILE  = Path("flags.json")
 _CORR_FILE   = Path("corrections.json")
 _DECOM_FILE  = Path("decommissions.json")
 _NEWSRV_FILE = Path("new_servers.json")
+_INVENTORY_FILE      = Path("current_inventory.xlsx")
+_INVENTORY_META_FILE = Path("current_inventory_meta.json")
+_INVENTORY_PREV_FILE = Path("prev_inventory.xlsx")
+_INVENTORY_PREV_META = Path("prev_inventory_meta.json")
+_ARCHIVE_DIR = Path("archive")
 
 # ── Colour palette ────────────────────────────────────────────────────────────
 BLUE   = "#4a8cff"; RED    = "#ff4f6a"; GREEN  = "#30d988"
@@ -314,6 +319,69 @@ def load_excel(file_bytes, filename):
     df = df[~df.apply(lambda r: r.str.strip().eq("").all(), axis=1)]
     return normalise_columns(df)
 
+# ── Inventory persistence (survives server restart/crash) ───────────────────
+def persist_inventory(df, filename, status_col, uploaded_at, total_rows, quality,
+                       which="current"):
+    """Save the uploaded inventory + its metadata to disk so a server restart
+    or crash doesn't lose the data. Also archives a dated copy."""
+    xlsx_path = _INVENTORY_FILE if which == "current" else _INVENTORY_PREV_FILE
+    meta_path = _INVENTORY_META_FILE if which == "current" else _INVENTORY_PREV_META
+    try:
+        df.to_excel(xlsx_path, index=False)
+        meta = {
+            "filename": filename, "status_col": status_col,
+            "uploaded_at": uploaded_at, "total_rows": total_rows,
+            "quality": quality,
+        }
+        meta_path.write_text(json.dumps(meta, indent=2))
+        if which == "current":
+            archive_inventory(df, filename)
+    except Exception:
+        log.exception("Failed to persist inventory to disk")
+
+def archive_inventory(df, filename):
+    """Keep a dated snapshot of every uploaded inventory file for history."""
+    try:
+        _ARCHIVE_DIR.mkdir(exist_ok=True)
+        stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", filename)[:60]
+        archive_path = _ARCHIVE_DIR / f"{stamp}__{safe_name}"
+        df.to_excel(archive_path, index=False)
+    except Exception:
+        log.exception("Failed to archive inventory")
+
+def load_persisted_inventory():
+    """On startup, restore the last uploaded inventory (and previous-month
+    file, if any) from disk so a crash/restart doesn't require re-upload."""
+    if _INVENTORY_FILE.exists() and _INVENTORY_META_FILE.exists():
+        try:
+            df = pd.read_excel(_INVENTORY_FILE, dtype=str).fillna("").astype(str)
+            df = normalise_columns(df)
+            meta = json.loads(_INVENTORY_META_FILE.read_text())
+            STORE["df"]          = df
+            STORE["status_col"]  = meta.get("status_col")
+            STORE["filename"]    = meta.get("filename")
+            STORE["uploaded_at"] = meta.get("uploaded_at")
+            STORE["total_rows"]  = meta.get("total_rows", len(df))
+            STORE["quality"]     = meta.get("quality", {})
+            log.info("Restored inventory from disk: %s (%d rows)",
+                     STORE["filename"], STORE["total_rows"])
+        except Exception:
+            log.exception("Failed to restore persisted inventory")
+
+    if _INVENTORY_PREV_FILE.exists() and _INVENTORY_PREV_META.exists():
+        try:
+            df = pd.read_excel(_INVENTORY_PREV_FILE, dtype=str).fillna("").astype(str)
+            df = normalise_columns(df)
+            meta = json.loads(_INVENTORY_PREV_META.read_text())
+            STORE["df_prev"]    = df
+            STORE["prev_status"] = meta.get("status_col")
+            STORE["prev_file"]   = meta.get("filename")
+            log.info("Restored previous-month inventory from disk: %s (%d rows)",
+                     STORE["prev_file"], len(df))
+        except Exception:
+            log.exception("Failed to restore persisted previous inventory")
+
 def quality_check(df, sc):
     issues = {}
     for c in ["Application Name", "Commercial Category",
@@ -469,7 +537,7 @@ def add_correction(hostname, column, current_val, suggested_val, reason, usernam
         "user":          username,
         "name":          full_name,
         "ts":            datetime.now().strftime("%d %b %Y %H:%M"),
-        "status":        "Pending",   # Pending | Reviewed
+        "status":        "Pending",   # Pending | Approved | Rejected
     }
     corrs[entry["id"]] = entry
     _save_json(_CORR_FILE, corrs)
@@ -477,14 +545,16 @@ def add_correction(hostname, column, current_val, suggested_val, reason, usernam
            f"user={username} host={hostname} col={column} val={suggested_val}")
     return entry
 
-def mark_correction_reviewed(corr_id, username):
+def mark_correction_decision(corr_id, decision, reason, username):
+    """decision: 'Approved' or 'Rejected'"""
     corrs = get_corrections()
     if corr_id in corrs:
-        corrs[corr_id]["status"]      = "Reviewed"
-        corrs[corr_id]["reviewed_by"] = username
-        corrs[corr_id]["reviewed_ts"] = datetime.now().strftime("%d %b %Y %H:%M")
+        corrs[corr_id]["status"]           = decision
+        corrs[corr_id]["decision_reason"]  = (reason or "").strip()
+        corrs[corr_id]["reviewed_by"]      = username
+        corrs[corr_id]["reviewed_ts"]      = datetime.now().strftime("%d %b %Y %H:%M")
         _save_json(_CORR_FILE, corrs)
-        _audit("CORRECTION_REVIEWED", f"admin={username} id={corr_id}")
+        _audit(f"CORRECTION_{decision.upper()}", f"admin={username} id={corr_id} reason={reason}")
 
 def delete_correction(corr_id, username):
     corrs = get_corrections()
@@ -509,21 +579,22 @@ def add_decommission(hostname, reason, eff_date, comment, username, full_name):
         "user":        username,
         "name":        full_name,
         "ts":          datetime.now().strftime("%d %b %Y %H:%M"),
-        "status":      "Pending",   # Pending | Reviewed
+        "status":      "Pending",   # Pending | Approved | Rejected
     }
     decs[entry["id"]] = entry
     _save_json(_DECOM_FILE, decs)
     _audit("DECOM_ADD", f"user={username} host={hostname} reason={reason}")
     return entry
 
-def mark_decom_reviewed(dec_id, username):
+def mark_decom_decision(dec_id, decision, reason, username):
     decs = get_decommissions()
     if dec_id in decs:
-        decs[dec_id]["status"]      = "Reviewed"
-        decs[dec_id]["reviewed_by"] = username
-        decs[dec_id]["reviewed_ts"] = datetime.now().strftime("%d %b %Y %H:%M")
+        decs[dec_id]["status"]          = decision
+        decs[dec_id]["decision_reason"] = (reason or "").strip()
+        decs[dec_id]["reviewed_by"]     = username
+        decs[dec_id]["reviewed_ts"]     = datetime.now().strftime("%d %b %Y %H:%M")
         _save_json(_DECOM_FILE, decs)
-        _audit("DECOM_REVIEWED", f"admin={username} id={dec_id}")
+        _audit(f"DECOM_{decision.upper()}", f"admin={username} id={dec_id} reason={reason}")
 
 def delete_decommission(dec_id, username):
     decs = get_decommissions()
@@ -550,7 +621,7 @@ def add_new_server(fields, comment, username, full_name):
         "user":     username,
         "name":     full_name,
         "ts":       datetime.now().strftime("%d %b %Y %H:%M"),
-        "status":   "Pending",   # Pending | Reviewed
+        "status":   "Pending",   # Pending | Approved | Rejected
     }
     news[entry["id"]] = entry
     _save_json(_NEWSRV_FILE, news)
@@ -558,14 +629,15 @@ def add_new_server(fields, comment, username, full_name):
            f"user={username} host={fields.get('Server HostName','')}")
     return entry
 
-def mark_newsrv_reviewed(ns_id, username):
+def mark_newsrv_decision(ns_id, decision, reason, username):
     news = get_new_servers()
     if ns_id in news:
-        news[ns_id]["status"]      = "Reviewed"
-        news[ns_id]["reviewed_by"] = username
-        news[ns_id]["reviewed_ts"] = datetime.now().strftime("%d %b %Y %H:%M")
+        news[ns_id]["status"]          = decision
+        news[ns_id]["decision_reason"] = (reason or "").strip()
+        news[ns_id]["reviewed_by"]     = username
+        news[ns_id]["reviewed_ts"]     = datetime.now().strftime("%d %b %Y %H:%M")
         _save_json(_NEWSRV_FILE, news)
-        _audit("NEWSRV_REVIEWED", f"admin={username} id={ns_id}")
+        _audit(f"NEWSRV_{decision.upper()}", f"admin={username} id={ns_id} reason={reason}")
 
 def delete_new_server(ns_id, username):
     news = get_new_servers()
@@ -655,6 +727,9 @@ app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.json.sort_keys = False   # preserve column order (Server HostName first) in JSON responses
 
+# Restore last uploaded inventory from disk (survives crash/restart) — runs once on import
+load_persisted_inventory()
+
 # ── Auth routes ───────────────────────────────────────────────────────────────
 @app.route("/login", methods=["GET", "POST"])
 def login():
@@ -697,12 +772,16 @@ def upload():
             STORE["df_prev"]    = df
             STORE["prev_status"] = sc
             STORE["prev_file"]   = f.filename
+            persist_inventory(df, f.filename, sc, None, len(df), {}, which="prev")
+            _audit("UPLOAD_PREV", f"user={session.get('username')} file={f.filename} rows={len(df)}")
             return jsonify({"ok": True, "filename": f.filename,
                             "rows": len(df), "status_col": sc or "Not detected"})
         qc = quality_check(df, sc)
+        uploaded_at = datetime.now().strftime("%d %b %Y %H:%M")
         STORE.update({"df": df, "status_col": sc, "filename": f.filename,
-                      "uploaded_at": datetime.now().strftime("%d %b %Y %H:%M"),
+                      "uploaded_at": uploaded_at,
                       "total_rows": len(df), "quality": qc})
+        persist_inventory(df, f.filename, sc, uploaded_at, len(df), qc, which="current")
         _audit("UPLOAD", f"user={session.get('username')} file={f.filename} rows={len(df)}")
         return jsonify({"ok": True, "filename": f.filename, "rows": len(df),
                         "status_col": sc or "Not detected", "quality": qc})
@@ -1108,9 +1187,13 @@ def correction_add():
 @_login_required
 @_admin_required
 def admin_correction_review():
-    data = request.get_json(force=True)
-    cid  = data.get("id","").strip()
-    mark_correction_reviewed(cid, session.get("username",""))
+    data     = request.get_json(force=True)
+    cid      = data.get("id","").strip()
+    decision = data.get("decision","Approved").strip()
+    reason   = data.get("reason","")
+    if decision not in ("Approved","Rejected"):
+        return jsonify({"error":"Invalid decision"}), 400
+    mark_correction_decision(cid, decision, reason, session.get("username",""))
     return jsonify({"ok": True})
 
 @app.route("/admin/correction/delete", methods=["POST"])
@@ -1142,8 +1225,12 @@ def decommission_add():
 @_login_required
 @_admin_required
 def admin_decom_review():
-    data = request.get_json(force=True)
-    mark_decom_reviewed(data.get("id","").strip(), session.get("username",""))
+    data     = request.get_json(force=True)
+    decision = data.get("decision","Approved").strip()
+    reason   = data.get("reason","")
+    if decision not in ("Approved","Rejected"):
+        return jsonify({"error":"Invalid decision"}), 400
+    mark_decom_decision(data.get("id","").strip(), decision, reason, session.get("username",""))
     return jsonify({"ok": True})
 
 @app.route("/admin/decommission/delete", methods=["POST"])
@@ -1164,6 +1251,7 @@ def admin_decom_report():
              "Effective Date": v["eff_date"], "Comment": v["comment"],
              "Submitted By": v["name"], "Username": v["user"],
              "Submitted At": v["ts"], "Status": v["status"],
+             "Decision Reason": v.get("decision_reason",""),
              "Reviewed By": v.get("reviewed_by",""),
              "Reviewed At": v.get("reviewed_ts","")} for v in decs.values()]
     buf = io.BytesIO()
@@ -1191,8 +1279,12 @@ def newserver_add():
 @_login_required
 @_admin_required
 def admin_newsrv_review():
-    data = request.get_json(force=True)
-    mark_newsrv_reviewed(data.get("id","").strip(), session.get("username",""))
+    data     = request.get_json(force=True)
+    decision = data.get("decision","Approved").strip()
+    reason   = data.get("reason","")
+    if decision not in ("Approved","Rejected"):
+        return jsonify({"error":"Invalid decision"}), 400
+    mark_newsrv_decision(data.get("id","").strip(), decision, reason, session.get("username",""))
     return jsonify({"ok": True})
 
 @app.route("/admin/newserver/delete", methods=["POST"])
@@ -1214,6 +1306,7 @@ def admin_newsrv_report():
         row = {"ID": v["id"], **v["fields"], "Comment": v["comment"],
                "Submitted By": v["name"], "Username": v["user"],
                "Submitted At": v["ts"], "Status": v["status"],
+               "Decision Reason": v.get("decision_reason",""),
                "Reviewed By": v.get("reviewed_by",""),
                "Reviewed At": v.get("reviewed_ts","")}
         rows.append(row)
@@ -1222,6 +1315,58 @@ def admin_newsrv_report():
     buf.seek(0)
     return send_file(buf, as_attachment=True,
                      download_name=f"new_servers_report_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+@app.route("/admin/monthly_changes_report")
+@_login_required
+@_admin_required
+def admin_monthly_changes_report():
+    """Consolidated, ready-to-apply record of every APPROVED change this
+    month — corrections, decommissions, and new servers — across three
+    sheets in one Excel file. This is what admin works from when updating
+    next month's master inventory."""
+    corrs = get_corrections()
+    decs  = get_decommissions()
+    news  = get_new_servers()
+
+    corr_rows = [{
+        "Hostname": v["hostname"], "Column": v["column"],
+        "Current Value": v["current_val"], "New Value": v["suggested_val"],
+        "Reason Given": v["reason"], "Submitted By": v["name"],
+        "Submitted At": v["ts"], "Approved By": v.get("reviewed_by",""),
+        "Approved At": v.get("reviewed_ts",""),
+        "Admin Note": v.get("decision_reason",""),
+    } for v in corrs.values() if v.get("status") == "Approved"]
+
+    decom_rows = [{
+        "Hostname": v["hostname"], "Reason": v["reason"],
+        "Effective Date": v["eff_date"], "Comment": v["comment"],
+        "Submitted By": v["name"], "Submitted At": v["ts"],
+        "Approved By": v.get("reviewed_by",""), "Approved At": v.get("reviewed_ts",""),
+        "Admin Note": v.get("decision_reason",""),
+    } for v in decs.values() if v.get("status") == "Approved"]
+
+    newsrv_rows = [{
+        **v["fields"], "Comment": v["comment"],
+        "Submitted By": v["name"], "Submitted At": v["ts"],
+        "Approved By": v.get("reviewed_by",""), "Approved At": v.get("reviewed_ts",""),
+        "Admin Note": v.get("decision_reason",""),
+    } for v in news.values() if v.get("status") == "Approved"]
+
+    if not corr_rows and not decom_rows and not newsrv_rows:
+        return "No approved changes to report yet", 200
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        (pd.DataFrame(corr_rows) if corr_rows else pd.DataFrame(columns=["Hostname"])) \
+            .to_excel(writer, sheet_name="Corrections", index=False)
+        (pd.DataFrame(decom_rows) if decom_rows else pd.DataFrame(columns=["Hostname"])) \
+            .to_excel(writer, sheet_name="Decommissions", index=False)
+        (pd.DataFrame(newsrv_rows) if newsrv_rows else pd.DataFrame(columns=["Server HostName"])) \
+            .to_excel(writer, sheet_name="New Servers", index=False)
+    buf.seek(0)
+    fname = f"monthly_changes_to_apply_{datetime.now().strftime('%Y%m%d')}.xlsx"
+    return send_file(buf, as_attachment=True, download_name=fname,
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 # ── Admin: user management ────────────────────────────────────────────────────
@@ -1411,6 +1556,7 @@ def admin_corrections_report():
              "Suggested Value": v["suggested_val"], "Reason": v["reason"],
              "Submitted By": v["name"], "Username": v["user"],
              "Submitted At": v["ts"], "Status": v["status"],
+             "Decision Reason": v.get("decision_reason",""),
              "Reviewed By": v.get("reviewed_by",""),
              "Reviewed At": v.get("reviewed_ts","")} for v in corrs.values()]
     buf = io.BytesIO()
@@ -1485,7 +1631,8 @@ def admin_data():
 
     # ── Build corrections list ───────────────────────────────────────────────
     pending_corrs   = [v for v in corrs.values() if v.get("status") == "Pending"]
-    reviewed_corrs  = [v for v in corrs.values() if v.get("status") == "Reviewed"]
+    approved_corrs  = [v for v in corrs.values() if v.get("status") == "Approved"]
+    rejected_corrs  = [v for v in corrs.values() if v.get("status") == "Rejected"]
 
     # ── Decommissions + new servers (enrich with current inventory data) ────
     decs = get_decommissions()
@@ -1496,22 +1643,27 @@ def admin_data():
             not df[df["Server HostName"].str.strip().str.lower() == hn_low].empty
         )
     pending_decs  = [v for v in decs.values() if v.get("status") == "Pending"]
-    reviewed_decs = [v for v in decs.values() if v.get("status") == "Reviewed"]
+    approved_decs = [v for v in decs.values() if v.get("status") == "Approved"]
+    rejected_decs = [v for v in decs.values() if v.get("status") == "Rejected"]
 
     news = get_new_servers()
     pending_news  = [v for v in news.values() if v.get("status") == "Pending"]
-    reviewed_news = [v for v in news.values() if v.get("status") == "Reviewed"]
+    approved_news = [v for v in news.values() if v.get("status") == "Approved"]
+    rejected_news = [v for v in news.values() if v.get("status") == "Rejected"]
 
     return jsonify({
         "tag_count":        sum(len(v) for v in tags.values()),
         "note_count":       sum(len(v) for v in notes.values()),
         "flag_count":       len(flags),
         "corr_pending":     len(pending_corrs),
-        "corr_reviewed":    len(reviewed_corrs),
+        "corr_approved":    len(approved_corrs),
+        "corr_rejected":    len(rejected_corrs),
         "decom_pending":    len(pending_decs),
-        "decom_reviewed":   len(reviewed_decs),
+        "decom_approved":   len(approved_decs),
+        "decom_rejected":   len(rejected_decs),
         "newsrv_pending":   len(pending_news),
-        "newsrv_reviewed":  len(reviewed_news),
+        "newsrv_approved":  len(approved_news),
+        "newsrv_rejected":  len(rejected_news),
         "server_count":     STORE["total_rows"],
         "filename":         STORE["filename"] or "None",
         "uploaded_at":      STORE["uploaded_at"] or "—",
@@ -2238,6 +2390,9 @@ tr:hover td{background:var(--surf2)}
   <div id="admin-loading" class="loading-row"><div class="spinner"></div></div>
   <div id="admin-content" style="display:none">
 
+    <!-- Monthly Changes banner -->
+    <div id="monthly-changes-banner" style="margin-bottom:16px"></div>
+
     <!-- Summary cards -->
     <div class="admin-grid" id="admin-stats"></div>
 
@@ -2251,17 +2406,20 @@ tr:hover td{background:var(--surf2)}
         <a href="/admin/corrections_report" style="float:right">
           <button class="btn btn-xs btn-orange">📥 Export All</button></a>
       </div>
-      <!-- Tab bar: Pending / Reviewed -->
       <div style="display:flex;gap:6px;margin-bottom:12px">
         <button class="btn btn-sm" id="corr-tab-pending"
           onclick="showCorrTab('pending')" style="background:var(--orange)">
           ⏳ Pending <span id="corr-pending-count"></span></button>
-        <button class="btn btn-sm btn-outline" id="corr-tab-reviewed"
-          onclick="showCorrTab('reviewed')">
-          ✅ Reviewed <span id="corr-reviewed-count"></span></button>
+        <button class="btn btn-sm btn-outline" id="corr-tab-approved"
+          onclick="showCorrTab('approved')">
+          ✅ Approved <span id="corr-approved-count"></span></button>
+        <button class="btn btn-sm btn-outline" id="corr-tab-rejected"
+          onclick="showCorrTab('rejected')">
+          ❌ Rejected <span id="corr-rejected-count"></span></button>
       </div>
       <div id="corr-pending-table"></div>
-      <div id="corr-reviewed-table" style="display:none"></div>
+      <div id="corr-approved-table" style="display:none"></div>
+      <div id="corr-rejected-table" style="display:none"></div>
     </div>
 
     <!-- ── DECOMMISSIONS ── -->
@@ -2278,12 +2436,16 @@ tr:hover td{background:var(--surf2)}
         <button class="btn btn-sm" id="decom-tab-pending"
           onclick="showDecomTab('pending')" style="background:var(--red)">
           ⏳ Pending <span id="decom-pending-count"></span></button>
-        <button class="btn btn-sm btn-outline" id="decom-tab-reviewed"
-          onclick="showDecomTab('reviewed')">
-          ✅ Reviewed <span id="decom-reviewed-count"></span></button>
+        <button class="btn btn-sm btn-outline" id="decom-tab-approved"
+          onclick="showDecomTab('approved')">
+          ✅ Approved <span id="decom-approved-count"></span></button>
+        <button class="btn btn-sm btn-outline" id="decom-tab-rejected"
+          onclick="showDecomTab('rejected')">
+          ❌ Rejected <span id="decom-rejected-count"></span></button>
       </div>
       <div id="decom-pending-table"></div>
-      <div id="decom-reviewed-table" style="display:none"></div>
+      <div id="decom-approved-table" style="display:none"></div>
+      <div id="decom-rejected-table" style="display:none"></div>
     </div>
 
     <!-- ── NEW SERVERS ── -->
@@ -2300,12 +2462,16 @@ tr:hover td{background:var(--surf2)}
         <button class="btn btn-sm" id="newsrv-tab-pending"
           onclick="showNewsrvTab('pending')" style="background:var(--green);color:#000">
           ⏳ Pending <span id="newsrv-pending-count"></span></button>
-        <button class="btn btn-sm btn-outline" id="newsrv-tab-reviewed"
-          onclick="showNewsrvTab('reviewed')">
-          ✅ Reviewed <span id="newsrv-reviewed-count"></span></button>
+        <button class="btn btn-sm btn-outline" id="newsrv-tab-approved"
+          onclick="showNewsrvTab('approved')">
+          ✅ Approved <span id="newsrv-approved-count"></span></button>
+        <button class="btn btn-sm btn-outline" id="newsrv-tab-rejected"
+          onclick="showNewsrvTab('rejected')">
+          ❌ Rejected <span id="newsrv-rejected-count"></span></button>
       </div>
       <div id="newsrv-pending-table"></div>
-      <div id="newsrv-reviewed-table" style="display:none"></div>
+      <div id="newsrv-approved-table" style="display:none"></div>
+      <div id="newsrv-rejected-table" style="display:none"></div>
     </div>
 
     <!-- ── FLAGS ── -->
@@ -2424,6 +2590,30 @@ tr:hover td{background:var(--surf2)}
     </div>
     <button class="btn btn-sm" onclick="submitPwReset()">Update Password</button>
     <div id="pw-reset-msg" style="margin-top:8px"></div>
+  </div>
+</div>
+
+<!-- ── Approve / Reject Decision Modal (shared by Corrections / Decommissions / New Servers) ── -->
+<div class="modal-overlay" id="decision-modal-overlay" onclick="closeDecisionModal(event)">
+  <div class="modal" style="max-width:440px">
+    <div class="modal-title">
+      <span id="decision-modal-title">Review Item</span>
+      <span class="modal-close" onclick="document.getElementById('decision-modal-overlay').classList.remove('show')">✕</span>
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:14px">
+      <button class="btn" id="decision-btn-approve" onclick="setDecisionChoice('Approved')"
+        style="flex:1;background:var(--green);color:#000">✅ Approve</button>
+      <button class="btn" id="decision-btn-reject" onclick="setDecisionChoice('Rejected')"
+        style="flex:1;background:var(--red)">❌ Reject</button>
+    </div>
+    <div style="font-size:.74rem;color:var(--muted);margin-bottom:4px">
+      Note (optional) — visible in the monthly changes report</div>
+    <input type="text" id="decision-reason-input" placeholder="e.g. Confirmed with infra team, applying next upload"
+      style="width:100%;background:var(--surf2);border:1px solid var(--border);color:var(--text);
+      padding:8px 11px;border-radius:8px;font-size:.84rem;margin-bottom:12px">
+    <button class="btn btn-sm" id="decision-submit-btn" onclick="submitDecisionModal()" disabled
+      style="opacity:.5">Select Approve or Reject first</button>
+    <div id="decision-modal-msg" style="margin-top:8px"></div>
   </div>
 </div>
 
@@ -3317,14 +3507,20 @@ function loadAdmin(){
         <div class="num c-orange">${d.corr_pending}</div>
         <div class="lbl">Pending Corrections</div></div>
       <div class="admin-card">
-        <div class="num c-green">${d.corr_reviewed}</div>
-        <div class="lbl">Reviewed Corrections</div></div>
+        <div class="num c-green">${d.corr_approved}</div>
+        <div class="lbl">Approved Corrections</div></div>
       <div class="admin-card">
         <div class="num c-red">${d.decom_pending}</div>
         <div class="lbl">Pending Decommissions</div></div>
       <div class="admin-card">
+        <div class="num c-green">${d.decom_approved}</div>
+        <div class="lbl">Approved Decommissions</div></div>
+      <div class="admin-card">
         <div class="num c-green">${d.newsrv_pending}</div>
         <div class="lbl">Pending New Servers</div></div>
+      <div class="admin-card">
+        <div class="num c-green">${d.newsrv_approved}</div>
+        <div class="lbl">Approved New Servers</div></div>
       ${d.quality&&Object.keys(d.quality).length?
         `<div class="admin-card" style="text-align:left;grid-column:1/-1">
           <div class="quality-panel"><h4>⚠️ Data Quality</h4>
@@ -3332,36 +3528,57 @@ function loadAdmin(){
             `<div style="font-size:.8rem;color:var(--muted)">⚠️ <b>${esc(k)}</b>: <span style="color:var(--yellow)">${v}</span> blank rows</div>`
           ).join('')}</div></div>`:''}`;
 
+    // ── Monthly Changes (Approved items, ready to apply) ──
+    const totalApproved = (d.corr_approved||0) + (d.decom_approved||0) + (d.newsrv_approved||0);
+    const mcEl = document.getElementById('monthly-changes-banner');
+    if(mcEl){
+      mcEl.innerHTML = totalApproved
+        ? `<div class="alert alert-success" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">
+            <span>📦 <b>${totalApproved}</b> approved change${totalApproved===1?'':'s'} ready to apply in next month's master Excel.</span>
+            <a href="/admin/monthly_changes_report"><button class="btn btn-sm btn-green">📥 Download Monthly Changes Report</button></a>
+          </div>`
+        : `<div class="alert alert-info">No approved changes yet this cycle. Review pending items below.</div>`;
+    }
+
     // ── Corrections ──
     const pending   = (d.corrections||[]).filter(c=>c.status==='Pending');
-    const reviewed  = (d.corrections||[]).filter(c=>c.status==='Reviewed');
+    const approved  = (d.corrections||[]).filter(c=>c.status==='Approved');
+    const rejected  = (d.corrections||[]).filter(c=>c.status==='Rejected');
     const pendBadge = document.getElementById('corr-pending-badge');
     if(pendBadge){ pendBadge.style.display=pending.length?'':'none'; pendBadge.textContent=`${pending.length} pending`; }
     document.getElementById('corr-pending-count').textContent=`(${pending.length})`;
-    document.getElementById('corr-reviewed-count').textContent=`(${reviewed.length})`;
+    document.getElementById('corr-approved-count').textContent=`(${approved.length})`;
+    document.getElementById('corr-rejected-count').textContent=`(${rejected.length})`;
 
-    renderCorrTable('corr-pending-table', pending, false);
-    renderCorrTable('corr-reviewed-table', reviewed, true);
+    renderCorrTable('corr-pending-table', pending, 'pending');
+    renderCorrTable('corr-approved-table', approved, 'approved');
+    renderCorrTable('corr-rejected-table', rejected, 'rejected');
 
     // ── Decommissions ──
     const decPending  = (d.decommissions||[]).filter(c=>c.status==='Pending');
-    const decReviewed = (d.decommissions||[]).filter(c=>c.status==='Reviewed');
+    const decApproved = (d.decommissions||[]).filter(c=>c.status==='Approved');
+    const decRejected = (d.decommissions||[]).filter(c=>c.status==='Rejected');
     const decBadge = document.getElementById('decom-pending-badge');
     if(decBadge){ decBadge.style.display=decPending.length?'':'none'; decBadge.textContent=`${decPending.length} pending`; }
     document.getElementById('decom-pending-count').textContent=`(${decPending.length})`;
-    document.getElementById('decom-reviewed-count').textContent=`(${decReviewed.length})`;
-    renderDecomTable('decom-pending-table', decPending, false);
-    renderDecomTable('decom-reviewed-table', decReviewed, true);
+    document.getElementById('decom-approved-count').textContent=`(${decApproved.length})`;
+    document.getElementById('decom-rejected-count').textContent=`(${decRejected.length})`;
+    renderDecomTable('decom-pending-table', decPending, 'pending');
+    renderDecomTable('decom-approved-table', decApproved, 'approved');
+    renderDecomTable('decom-rejected-table', decRejected, 'rejected');
 
     // ── New Servers ──
     const nsPending  = (d.new_servers||[]).filter(c=>c.status==='Pending');
-    const nsReviewed = (d.new_servers||[]).filter(c=>c.status==='Reviewed');
+    const nsApproved = (d.new_servers||[]).filter(c=>c.status==='Approved');
+    const nsRejected = (d.new_servers||[]).filter(c=>c.status==='Rejected');
     const nsBadge = document.getElementById('newsrv-pending-badge');
     if(nsBadge){ nsBadge.style.display=nsPending.length?'':'none'; nsBadge.textContent=`${nsPending.length} pending`; }
     document.getElementById('newsrv-pending-count').textContent=`(${nsPending.length})`;
-    document.getElementById('newsrv-reviewed-count').textContent=`(${nsReviewed.length})`;
-    renderNewsrvTable('newsrv-pending-table', nsPending, false);
-    renderNewsrvTable('newsrv-reviewed-table', nsReviewed, true);
+    document.getElementById('newsrv-approved-count').textContent=`(${nsApproved.length})`;
+    document.getElementById('newsrv-rejected-count').textContent=`(${nsRejected.length})`;
+    renderNewsrvTable('newsrv-pending-table', nsPending, 'pending');
+    renderNewsrvTable('newsrv-approved-table', nsApproved, 'approved');
+    renderNewsrvTable('newsrv-rejected-table', nsRejected, 'rejected');
 
     // ── Flags ──
     const flags = d.flag_rows||[];
@@ -3433,19 +3650,23 @@ function loadAdmin(){
   });
 }
 
-function renderCorrTable(containerId, rows, isReviewed){
+function renderCorrTable(containerId, rows, mode){
+  // mode: 'pending' | 'approved' | 'rejected'
   const el=document.getElementById(containerId);
   if(!rows.length){
-    el.innerHTML=`<div class="alert ${isReviewed?'alert-success':'alert-info'}">
-      ${isReviewed?'No reviewed corrections yet.':'No pending corrections — all clear! ✅'}</div>`;
+    const msg = {pending:'No pending corrections — all clear! ✅',
+                 approved:'No approved corrections yet.',
+                 rejected:'No rejected corrections.'}[mode];
+    el.innerHTML=`<div class="alert ${mode==='pending'?'alert-info':'alert-success'}">${msg}</div>`;
     return;
   }
+  const isPending = mode === 'pending';
   el.innerHTML=`<div class="tbl-wrap"><table>
     <thead><tr>
       <th>Hostname</th><th>Column</th><th>Current Value</th>
       <th>Suggested Value</th><th>Reason</th>
       <th>Submitted By</th><th>Date</th>
-      ${isReviewed?'<th>Reviewed By</th><th>Reviewed At</th>':'<th>Actions</th>'}
+      ${isPending?'<th>Actions</th>':'<th>Decision By</th><th>Decision Note</th>'}
     </tr></thead>
     <tbody>${rows.map(r=>`<tr>
       <td style="font-weight:700;color:var(--blue);font-family:monospace;cursor:pointer"
@@ -3456,33 +3677,24 @@ function renderCorrTable(containerId, rows, isReviewed){
       <td style="font-size:.76rem;color:var(--muted);max-width:180px;white-space:normal">${esc(r.reason||'—')}</td>
       <td style="font-size:.76rem">${esc(r.name)}</td>
       <td style="font-size:.74rem;color:var(--muted)">${esc(r.ts)}</td>
-      ${isReviewed
-        ?`<td style="font-size:.74rem">${esc(r.reviewed_by||'—')}</td>
-          <td style="font-size:.74rem;color:var(--muted)">${esc(r.reviewed_ts||'—')}</td>`
-        :`<td style="display:flex;gap:5px">
-          <button class="btn btn-xs btn-green" onclick="reviewCorr('${r.id}',this)">✅ Mark Reviewed</button>
+      ${isPending
+        ?`<td style="display:flex;gap:5px">
+          <button class="btn btn-xs btn-green" onclick="openDecisionModal('correction','${r.id}','${esc(r.hostname)}')">⚖️ Review</button>
           <button class="btn btn-xs btn-red"   onclick="deleteCorr('${r.id}',this)">🗑 Delete</button>
-        </td>`}
+        </td>`
+        :`<td style="font-size:.74rem">${esc(r.reviewed_by||'—')} · ${esc(r.reviewed_ts||'')}</td>
+          <td style="font-size:.74rem;color:var(--muted)">${esc(r.decision_reason||'—')}</td>`}
     </tr>`).join('')}</tbody></table></div>`;
 }
 
 function showCorrTab(tab){
-  const isPending = tab==='pending';
-  document.getElementById('corr-pending-table').style.display  = isPending?'':'none';
-  document.getElementById('corr-reviewed-table').style.display = isPending?'none':'';
-  document.getElementById('corr-tab-pending').style.background  = isPending?'var(--orange)':'';
-  document.getElementById('corr-tab-reviewed').style.background = isPending?'':'var(--green)';
-  document.getElementById('corr-tab-pending').style.color   = isPending?'#000':'';
-  document.getElementById('corr-tab-reviewed').style.color  = isPending?'':'#000';
-}
-
-async function reviewCorr(id, btn){
-  btn.disabled=true; btn.textContent='…';
-  const r=await fetch('/admin/correction/review',{method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({id})}).then(x=>x.json());
-  if(r.ok) loadAdmin();
-  else { btn.disabled=false; btn.textContent='✅ Mark Reviewed'; alert(r.error); }
+  ['pending','approved','rejected'].forEach(t=>{
+    document.getElementById(`corr-${t}-table`).style.display = (t===tab)?'':'none';
+    const btn = document.getElementById(`corr-tab-${t}`);
+    btn.className = (t===tab) ? 'btn btn-sm' : 'btn btn-sm btn-outline';
+    btn.style.background = (t===tab) ? {pending:'var(--orange)',approved:'var(--green)',rejected:'var(--red)'}[t] : '';
+    btn.style.color = (t===tab) ? (t==='rejected'?'#fff':'#000') : '';
+  });
 }
 
 async function deleteCorr(id, btn){
@@ -3495,18 +3707,21 @@ async function deleteCorr(id, btn){
 }
 
 // ── Decommissions admin table ──
-function renderDecomTable(containerId, rows, isReviewed){
+function renderDecomTable(containerId, rows, mode){
   const el=document.getElementById(containerId);
   if(!rows.length){
-    el.innerHTML=`<div class="alert ${isReviewed?'alert-success':'alert-info'}">
-      ${isReviewed?'No reviewed decommissions yet.':'No pending decommission reports — all clear! ✅'}</div>`;
+    const msg = {pending:'No pending decommission reports — all clear! ✅',
+                 approved:'No approved decommissions yet.',
+                 rejected:'No rejected decommissions.'}[mode];
+    el.innerHTML=`<div class="alert ${mode==='pending'?'alert-info':'alert-success'}">${msg}</div>`;
     return;
   }
+  const isPending = mode === 'pending';
   el.innerHTML=`<div class="tbl-wrap"><table>
     <thead><tr>
       <th>Hostname</th><th>Still in Inventory?</th><th>Reason</th><th>Eff. Date</th>
       <th>Comment</th><th>Submitted By</th><th>Date</th>
-      ${isReviewed?'<th>Reviewed By</th><th>Reviewed At</th>':'<th>Actions</th>'}
+      ${isPending?'<th>Actions</th>':'<th>Decision By</th><th>Decision Note</th>'}
     </tr></thead>
     <tbody>${rows.map(r=>`<tr>
       <td style="font-weight:700;color:var(--blue);font-family:monospace;cursor:pointer"
@@ -3520,29 +3735,24 @@ function renderDecomTable(containerId, rows, isReviewed){
       <td style="font-size:.76rem;color:var(--muted);max-width:160px;white-space:normal">${esc(r.comment||'—')}</td>
       <td style="font-size:.76rem">${esc(r.name)}</td>
       <td style="font-size:.74rem;color:var(--muted)">${esc(r.ts)}</td>
-      ${isReviewed
-        ?`<td style="font-size:.74rem">${esc(r.reviewed_by||'—')}</td>
-          <td style="font-size:.74rem;color:var(--muted)">${esc(r.reviewed_ts||'—')}</td>`
-        :`<td style="display:flex;gap:5px">
-          <button class="btn btn-xs btn-green" onclick="reviewDecom('${r.id}',this)">✅ Mark Reviewed</button>
+      ${isPending
+        ?`<td style="display:flex;gap:5px">
+          <button class="btn btn-xs btn-green" onclick="openDecisionModal('decommission','${r.id}','${esc(r.hostname)}')">⚖️ Review</button>
           <button class="btn btn-xs btn-red"   onclick="deleteDecom('${r.id}',this)">🗑 Delete</button>
-        </td>`}
+        </td>`
+        :`<td style="font-size:.74rem">${esc(r.reviewed_by||'—')} · ${esc(r.reviewed_ts||'')}</td>
+          <td style="font-size:.74rem;color:var(--muted)">${esc(r.decision_reason||'—')}</td>`}
     </tr>`).join('')}</tbody></table></div>`;
 }
 function showDecomTab(tab){
-  const isPending = tab==='pending';
-  document.getElementById('decom-pending-table').style.display  = isPending?'':'none';
-  document.getElementById('decom-reviewed-table').style.display = isPending?'none':'';
-  document.getElementById('decom-tab-pending').style.background  = isPending?'var(--red)':'';
-  document.getElementById('decom-tab-reviewed').style.background = isPending?'':'var(--green)';
-  document.getElementById('decom-tab-pending').style.color   = isPending?'#fff':'';
-  document.getElementById('decom-tab-reviewed').style.color  = isPending?'':'#000';
-}
-async function reviewDecom(id, btn){
-  btn.disabled=true; btn.textContent='…';
-  const r=await fetch('/admin/decommission/review',{method:'POST',
-    headers:{'Content-Type':'application/json'},body:JSON.stringify({id})}).then(x=>x.json());
-  if(r.ok) loadAdmin(); else { btn.disabled=false; btn.textContent='✅ Mark Reviewed'; }
+  ['pending','approved','rejected'].forEach(t=>{
+    document.getElementById(`decom-${t}-table`).style.display = (t===tab)?'':'none';
+    const btn = document.getElementById(`decom-tab-${t}`);
+    btn.className = (t===tab) ? 'btn btn-sm' : 'btn btn-sm btn-outline';
+    btn.style.background = (t===tab) ? {pending:'var(--red)',approved:'var(--green)',rejected:'var(--red)'}[t] : '';
+    btn.style.color = (t===tab) ? '#fff' : '';
+    if(t===tab && t==='approved') btn.style.color = '#000';
+  });
 }
 async function deleteDecom(id, btn){
   if(!confirm('Delete this decommission report?')) return;
@@ -3553,51 +3763,49 @@ async function deleteDecom(id, btn){
 }
 
 // ── New servers admin table ──
-function renderNewsrvTable(containerId, rows, isReviewed){
+function renderNewsrvTable(containerId, rows, mode){
   const el=document.getElementById(containerId);
   if(!rows.length){
-    el.innerHTML=`<div class="alert ${isReviewed?'alert-success':'alert-info'}">
-      ${isReviewed?'No reviewed new-server suggestions yet.':'No pending new-server suggestions — all clear! ✅'}</div>`;
+    const msg = {pending:'No pending new-server suggestions — all clear! ✅',
+                 approved:'No approved new servers yet.',
+                 rejected:'No rejected new servers.'}[mode];
+    el.innerHTML=`<div class="alert ${mode==='pending'?'alert-info':'alert-success'}">${msg}</div>`;
     return;
   }
+  const isPending = mode === 'pending';
   const fieldCols = ["Server HostName","Platform","Server Type(Physical/Virtual)",
     "Final OS","Server Role","Server DC Location"];
   el.innerHTML=`<div class="tbl-wrap"><table>
     <thead><tr>
       ${fieldCols.map(c=>`<th>${esc(c)}</th>`).join('')}
       <th>Comment</th><th>Submitted By</th><th>Date</th>
-      ${isReviewed?'<th>Reviewed By</th><th>Reviewed At</th>':'<th>Actions</th>'}
+      ${isPending?'<th>Actions</th>':'<th>Decision By</th><th>Decision Note</th>'}
     </tr></thead>
     <tbody>${rows.map(r=>{const f=r.fields||{};return `<tr>
       ${fieldCols.map((c,i)=>i===0
-        ?`<td style="font-weight:700;color:var(--blue);font-family:monospace">${esc(f[c]||'—')}</td>`
+        ?`<td style="font-weight:700;color:var(--blue);font-family:monospace;cursor:pointer"
+            onclick="showDetail('${esc(f[c]||'')}')">${esc(f[c]||'—')}</td>`
         :`<td style="font-size:.78rem">${esc(f[c]||'—')}</td>`).join('')}
       <td style="font-size:.76rem;color:var(--muted);max-width:160px;white-space:normal">${esc(r.comment||'—')}</td>
       <td style="font-size:.76rem">${esc(r.name)}</td>
       <td style="font-size:.74rem;color:var(--muted)">${esc(r.ts)}</td>
-      ${isReviewed
-        ?`<td style="font-size:.74rem">${esc(r.reviewed_by||'—')}</td>
-          <td style="font-size:.74rem;color:var(--muted)">${esc(r.reviewed_ts||'—')}</td>`
-        :`<td style="display:flex;gap:5px">
-          <button class="btn btn-xs btn-green" onclick="reviewNewsrv('${r.id}',this)">✅ Mark Reviewed</button>
+      ${isPending
+        ?`<td style="display:flex;gap:5px">
+          <button class="btn btn-xs btn-green" onclick="openDecisionModal('newserver','${r.id}','${esc(f['Server HostName']||'')}')">⚖️ Review</button>
           <button class="btn btn-xs btn-red"   onclick="deleteNewsrv('${r.id}',this)">🗑 Delete</button>
-        </td>`}
+        </td>`
+        :`<td style="font-size:.74rem">${esc(r.reviewed_by||'—')} · ${esc(r.reviewed_ts||'')}</td>
+          <td style="font-size:.74rem;color:var(--muted)">${esc(r.decision_reason||'—')}</td>`}
     </tr>`;}).join('')}</tbody></table></div>`;
 }
 function showNewsrvTab(tab){
-  const isPending = tab==='pending';
-  document.getElementById('newsrv-pending-table').style.display  = isPending?'':'none';
-  document.getElementById('newsrv-reviewed-table').style.display = isPending?'none':'';
-  document.getElementById('newsrv-tab-pending').style.background  = isPending?'var(--green)':'';
-  document.getElementById('newsrv-tab-reviewed').style.background = isPending?'':'var(--green)';
-  document.getElementById('newsrv-tab-pending').style.color   = '#000';
-  document.getElementById('newsrv-tab-reviewed').style.color  = isPending?'':'#000';
-}
-async function reviewNewsrv(id, btn){
-  btn.disabled=true; btn.textContent='…';
-  const r=await fetch('/admin/newserver/review',{method:'POST',
-    headers:{'Content-Type':'application/json'},body:JSON.stringify({id})}).then(x=>x.json());
-  if(r.ok) loadAdmin(); else { btn.disabled=false; btn.textContent='✅ Mark Reviewed'; }
+  ['pending','approved','rejected'].forEach(t=>{
+    document.getElementById(`newsrv-${t}-table`).style.display = (t===tab)?'':'none';
+    const btn = document.getElementById(`newsrv-tab-${t}`);
+    btn.className = (t===tab) ? 'btn btn-sm' : 'btn btn-sm btn-outline';
+    btn.style.background = (t===tab) ? {pending:'var(--green)',approved:'var(--green)',rejected:'var(--red)'}[t] : '';
+    btn.style.color = (t===tab) ? (t==='rejected'?'#fff':'#000') : '';
+  });
 }
 async function deleteNewsrv(id, btn){
   if(!confirm('Delete this new-server suggestion?')) return;
@@ -3605,6 +3813,59 @@ async function deleteNewsrv(id, btn){
   const r=await fetch('/admin/newserver/delete',{method:'POST',
     headers:{'Content-Type':'application/json'},body:JSON.stringify({id})}).then(x=>x.json());
   if(r.ok) loadAdmin();
+}
+
+// ── Shared Approve/Reject decision modal ──
+let _decisionTarget = {type:'', id:'', hostname:''};
+let _decisionChoice = '';
+
+function openDecisionModal(type, id, hostname){
+  _decisionTarget = {type, id, hostname};
+  _decisionChoice = '';
+  document.getElementById('decision-modal-title').textContent = `Review: ${hostname}`;
+  document.getElementById('decision-reason-input').value = '';
+  document.getElementById('decision-modal-msg').innerHTML = '';
+  document.getElementById('decision-btn-approve').style.outline = 'none';
+  document.getElementById('decision-btn-reject').style.outline = 'none';
+  const submitBtn = document.getElementById('decision-submit-btn');
+  submitBtn.disabled = true; submitBtn.style.opacity = '.5';
+  submitBtn.textContent = 'Select Approve or Reject first';
+  document.getElementById('decision-modal-overlay').classList.add('show');
+}
+function closeDecisionModal(e){
+  if(e.target===document.getElementById('decision-modal-overlay'))
+    document.getElementById('decision-modal-overlay').classList.remove('show');
+}
+function setDecisionChoice(choice){
+  _decisionChoice = choice;
+  document.getElementById('decision-btn-approve').style.outline =
+    choice==='Approved' ? '2px solid #fff' : 'none';
+  document.getElementById('decision-btn-reject').style.outline =
+    choice==='Rejected' ? '2px solid #fff' : 'none';
+  const submitBtn = document.getElementById('decision-submit-btn');
+  submitBtn.disabled = false; submitBtn.style.opacity = '1';
+  submitBtn.textContent = choice==='Approved' ? '✅ Confirm Approve' : '❌ Confirm Reject';
+  submitBtn.style.background = choice==='Approved' ? 'var(--green)' : 'var(--red)';
+  submitBtn.style.color = choice==='Approved' ? '#000' : '#fff';
+}
+async function submitDecisionModal(){
+  if(!_decisionChoice) return;
+  const reason = document.getElementById('decision-reason-input').value.trim();
+  const endpoints = {
+    correction: '/admin/correction/review',
+    decommission: '/admin/decommission/review',
+    newserver: '/admin/newserver/review',
+  };
+  const r = await fetch(endpoints[_decisionTarget.type], {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({id:_decisionTarget.id, decision:_decisionChoice, reason})}).then(x=>x.json());
+  if(r.error){
+    document.getElementById('decision-modal-msg').innerHTML =
+      `<div class="alert alert-error">${esc(r.error)}</div>`;
+    return;
+  }
+  document.getElementById('decision-modal-overlay').classList.remove('show');
+  loadAdmin();
 }
 
 async function adminDeleteNote(hostname, noteId, btn){
@@ -3824,16 +4085,15 @@ function renderMyDecomList(mine){
   const el = document.getElementById('decom-my-list');
   if(!mine.length){ el.innerHTML = '<div style="color:var(--dim);font-size:.82rem">No submissions yet.</div>'; return; }
   el.innerHTML = `<div class="tbl-wrap"><table>
-    <thead><tr><th>Hostname</th><th>Reason</th><th>Eff. Date</th><th>Comment</th><th>Submitted</th><th>Status</th></tr></thead>
+    <thead><tr><th>Hostname</th><th>Reason</th><th>Eff. Date</th><th>Comment</th><th>Submitted</th><th>Status</th><th>Admin Note</th></tr></thead>
     <tbody>${mine.map(m=>`<tr>
       <td style="font-weight:700;color:var(--blue);font-family:monospace">${esc(m.hostname)}</td>
       <td><span class="badge" style="background:rgba(255,79,106,.15);color:var(--red);border:1px solid rgba(255,79,106,.3)">${esc(m.reason)}</span></td>
       <td style="font-size:.78rem">${esc(m.eff_date||'—')}</td>
       <td style="font-size:.78rem;color:var(--muted)">${esc(m.comment||'—')}</td>
       <td style="font-size:.74rem;color:var(--muted)">${esc(m.ts)}</td>
-      <td><span class="badge ${m.status==='Reviewed'?'badge-live':''}"
-        style="${m.status==='Reviewed'?'':'background:rgba(255,194,64,.15);color:var(--yellow);border-color:rgba(255,194,64,.3)'}">
-        ${m.status==='Reviewed'?'✅ Reviewed':'⏳ Pending'}</span></td>
+      <td>${reviewStatusBadge(m.status)}</td>
+      <td style="font-size:.76rem;color:var(--muted)">${esc(m.decision_reason||'—')}</td>
     </tr>`).join('')}</tbody></table></div>`;
 }
 
@@ -3936,7 +4196,7 @@ function renderMyNewsrvList(mine){
   const el = document.getElementById('newsrv-my-list');
   if(!mine.length){ el.innerHTML = '<div style="color:var(--dim);font-size:.82rem">No submissions yet.</div>'; return; }
   el.innerHTML = `<div class="tbl-wrap"><table>
-    <thead><tr><th>Hostname</th><th>Platform</th><th>OS</th><th>Role</th><th>Comment</th><th>Submitted</th><th>Status</th></tr></thead>
+    <thead><tr><th>Hostname</th><th>Platform</th><th>OS</th><th>Role</th><th>Comment</th><th>Submitted</th><th>Status</th><th>Admin Note</th></tr></thead>
     <tbody>${mine.map(m=>{const f=m.fields||{};return `<tr>
       <td style="font-weight:700;color:var(--blue);font-family:monospace">${esc(f["Server HostName"]||'')}</td>
       <td style="font-size:.78rem">${esc(f["Platform"]||'—')}</td>
@@ -3944,9 +4204,8 @@ function renderMyNewsrvList(mine){
       <td style="font-size:.78rem">${esc(f["Server Role"]||'—')}</td>
       <td style="font-size:.78rem;color:var(--muted)">${esc(m.comment||'—')}</td>
       <td style="font-size:.74rem;color:var(--muted)">${esc(m.ts)}</td>
-      <td><span class="badge ${m.status==='Reviewed'?'badge-live':''}"
-        style="${m.status==='Reviewed'?'':'background:rgba(255,194,64,.15);color:var(--yellow);border-color:rgba(255,194,64,.3)'}">
-        ${m.status==='Reviewed'?'✅ Reviewed':'⏳ Pending'}</span></td>
+      <td>${reviewStatusBadge(m.status)}</td>
+      <td style="font-size:.76rem;color:var(--muted)">${esc(m.decision_reason||'—')}</td>
     </tr>`;}).join('')}</tbody></table></div>`;
 }
 
@@ -3982,7 +4241,7 @@ function loadActivity(){
       html+=`<div class="shdr" style="color:var(--orange);margin-top:16px">✏️ My Correction Suggestions</div>
         <div class="tbl-wrap"><table>
         <thead><tr><th>Hostname</th><th>Column</th><th>Current</th><th>Suggested</th>
-          <th>Reason</th><th>Submitted</th><th>Status</th></tr></thead>
+          <th>Reason</th><th>Submitted</th><th>Status</th><th>Admin Note</th></tr></thead>
         <tbody>${myCorrs.map(c=>`<tr>
           <td style="font-weight:700;color:var(--blue);font-family:monospace">${esc(c.hostname)}</td>
           <td><span class="badge badge-other" style="font-size:.68rem">${esc(c.column)}</span></td>
@@ -3990,9 +4249,8 @@ function loadActivity(){
           <td style="font-size:.78rem;color:var(--green);font-weight:600">${esc(c.suggested_val)}</td>
           <td style="font-size:.75rem;color:var(--muted)">${esc(c.reason||'—')}</td>
           <td style="font-size:.74rem;color:var(--muted)">${esc(c.ts)}</td>
-          <td><span class="badge ${c.status==='Reviewed'?'badge-live':'badge-notlive'}"
-            style="${c.status==='Reviewed'?'':'background:rgba(255,194,64,.15);color:var(--yellow);border-color:rgba(255,194,64,.3)'}">
-            ${c.status==='Reviewed'?'✅ Reviewed':'⏳ Pending'}</span></td>
+          <td>${reviewStatusBadge(c.status)}</td>
+          <td style="font-size:.74rem;color:var(--muted)">${esc(c.decision_reason||'—')}</td>
         </tr>`).join('')}</tbody></table></div>`;
     }
 
@@ -4033,6 +4291,12 @@ function typeBadge(v){
   if(l.includes('virtual'))  return `<span class="badge badge-virtual">Virtual</span>`;
   return `<span class="badge badge-other">${esc(v)||'—'}</span>`;
 }
+function reviewStatusBadge(status){
+  if(status==='Approved') return `<span class="badge badge-live">✅ Approved</span>`;
+  if(status==='Rejected') return `<span class="badge badge-notlive">❌ Rejected</span>`;
+  return `<span class="badge" style="background:rgba(255,194,64,.15);color:var(--yellow);
+    border-color:rgba(255,194,64,.3)">⏳ Pending</span>`;
+}
 function esc(s){
   return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;')
     .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -4072,6 +4336,11 @@ if __name__ == "__main__":
     print(f"  🏷️  Tags store     : {_TAGS_FILE.resolve()}")
     print(f"  📝 Notes store    : {_NOTES_FILE.resolve()}")
     print(f"  🚩 Flags store    : {_FLAGS_FILE.resolve()}")
+    if STORE["df"] is not None:
+        print(f"  💾 Inventory restored from disk: {STORE['filename']} ({STORE['total_rows']} rows)")
+    else:
+        print("  💾 No persisted inventory found — admin needs to upload")
+    print(f"  🗄️  Archive folder : {_ARCHIVE_DIR.resolve()}")
     print("  🔌 100% OFFLINE — No internet required")
     print("  Press Ctrl+C to stop")
     print("=" * 64 + "\n")
